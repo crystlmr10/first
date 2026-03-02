@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'home_page.dart';
 
 class LocationPermissionPage extends StatelessWidget {
   const LocationPermissionPage({super.key});
@@ -65,7 +66,10 @@ class LocationPermissionPage extends StatelessWidget {
                 height: 56,
                 child: ElevatedButton(
                   onPressed: () {
-                    // Logic for Home Page after enabling location
+                   Navigator.pushReplacement(
+                    context,
+                      MaterialPageRoute(builder: (context) => const HomePage()),
+                       );
                   },
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFF1A60FF),

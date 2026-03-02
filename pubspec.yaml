@@ -31,17 +31,32 @@ dependencies:
   flutter:
     sdk: flutter
 
+  # Icons
+  cupertino_icons: ^1.0.6
+
+  # Map Core
+  flutter_map: ^7.0.2
+  latlong2: ^0.9.1
+
+  # The ones causing your errors right now:
+  geolocator: ^13.0.2
+  flutter_polyline_points: ^2.1.0
+
+  # For your Python backend connection later
+  http: ^1.3.0
+
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
+  flutter_lints: ^3.0.0
 
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
   # activated in the `analysis_options.yaml` file located at the root of your
   # package. See that file for information about deactivating specific lint
   # rules and activating additional ones.
-  flutter_lints: ^6.0.0
+  
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
