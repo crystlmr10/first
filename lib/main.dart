@@ -1,9 +1,18 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
 import 'pages/login_page.dart';
-import 'pages/rescuer_login_page.dart'; // Ensure this exists
+import 'pages/rescuer_login_page.dart';
 
-void main() {
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  // Initialize Supabase for the Admin Website
+  await Supabase.initialize(
+    url: 'https://ttsrktldvvqrgkfhsbbl.supabase.co/',
+    anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR0c3JrdGxkdnZxcmdrZmhzYmJsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI1NDYxODcsImV4cCI6MjA4ODEyMjE4N30.DkQAOtyA4gezkPFCWPtyoS2UKw2NYvZcAlsAWbql3QY', // Paste your real anon key here!
+  );
+
   runApp(const FlooteApp());
 }
 
@@ -27,7 +36,7 @@ class FlooteOnboarding extends StatefulWidget {
 }
 
 class _FlooteOnboardingState extends State<FlooteOnboarding> {
-  // Logic for hidden rescuer access
+  // Logic for hidden rescuer access via five-tap gesture on the logo
   int _tapCount = 0;
   Timer? _tapTimer;
 
@@ -45,7 +54,7 @@ class _FlooteOnboardingState extends State<FlooteOnboarding> {
         MaterialPageRoute(builder: (context) => const RescuerLoginPage()),
       );
     } else {
-      // Reset if no follow-up tap occurs within 2 seconds
+      // Reset tap counter if no follow-up tap occurs within 2 seconds
       _tapTimer = Timer(const Duration(seconds: 2), () {
         setState(() {
           _tapCount = 0;
@@ -102,7 +111,7 @@ class _FlooteOnboardingState extends State<FlooteOnboarding> {
                 _buildFeatureCard(
                   Icons.location_on_outlined,
                   'Live Flood Data',
-                  'Real-time updates from LoRa sensors across Cebu City',
+                  'Real-time updates from sensors in Talisay, Tabunok, and Minglanilla',
                 ),
                 const SizedBox(height: 16),
                 _buildFeatureCard(
