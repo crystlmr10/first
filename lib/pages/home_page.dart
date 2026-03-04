@@ -13,10 +13,10 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   final MapController _mapController = MapController();
   
-  // NEW LOCATIONS: South District Sensors
-  final LatLng _tabunok = const LatLng(10.2685, 123.8402);    // Tabunok Flyover area
-  final LatLng _talisay = const LatLng(10.2547, 123.8483);    // Talisay Proper
-  final LatLng _minglanilla = const LatLng(10.2450, 123.7960); // Mingla Proper
+  // South District Sensors
+  final LatLng _tabunok = const LatLng(10.2685, 123.8402);
+  final LatLng _talisay = const LatLng(10.2547, 123.8483);
+  final LatLng _minglanilla = const LatLng(10.2450, 123.7960);
 
   LatLng? _currentPCPos;
   double _currentHeading = 0.0;
@@ -81,14 +81,27 @@ class _HomePageState extends State<HomePage> {
                   if (_currentPCPos != null)
                     Marker(
                       point: _currentPCPos!,
-                      width: 60,
-                      height: 60,
+                      width: 80,
+                      height: 80,
                       child: Transform.rotate(
                         angle: (_currentHeading * (3.14159 / 180)),
-                        child: Icon(
-                          Icons.navigation, 
-                          color: Colors.blue.withValues(alpha: 0.9), 
-                          size: 40
+                        child: Stack(
+                          alignment: Alignment.center,
+                          children: [
+                            Container(
+                              width: 40,
+                              height: 40,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: Colors.blue.withValues(alpha: 0.2),
+                              ),
+                            ),
+                            const Icon(
+                              Icons.directions_car_filled, 
+                              color: Colors.blue, 
+                              size: 35
+                            ),
+                          ],
                         ),
                       ),
                     ),
@@ -129,7 +142,6 @@ class _HomePageState extends State<HomePage> {
                 dense: true,
                 leading: const Icon(Icons.my_location, color: Colors.blue, size: 20),
                 title: const Text("Current Location", style: TextStyle(fontSize: 12, color: Colors.grey)),
-                // DYNAMIC SUBTITLE: Shows real coordinates or fetching status
                 subtitle: Text(
                   _currentPCPos != null 
                     ? "${_currentPCPos!.latitude.toStringAsFixed(4)}, ${_currentPCPos!.longitude.toStringAsFixed(4)}"
@@ -208,22 +220,29 @@ class _HomePageState extends State<HomePage> {
 
   Widget _buildSOSButton() {
     return Positioned(
-      bottom: 20,
+      bottom: 25,
       right: 20,
-      child: Container(
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: Colors.red,
-          shape: BoxShape.circle,
-          boxShadow: [
-            BoxShadow(
-              color: Colors.red.withValues(alpha: 0.4), 
-              blurRadius: 15, 
-              spreadRadius: 2
-            )
-          ],
+      child: GestureDetector(
+        onTap: () {},
+        child: Container(
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: const Color(0xFFD32F2F), 
+            shape: BoxShape.circle,
+            boxShadow: [
+              BoxShadow(
+                color: Colors.red.withValues(alpha: 0.5), 
+                blurRadius: 20, 
+                spreadRadius: 3
+              )
+            ],
+          ),
+          child: const Icon(
+            Icons.emergency_share, 
+            color: Colors.white, 
+            size: 32
+          ),
         ),
-        child: const Icon(Icons.emergency, color: Colors.white, size: 30),
       ),
     );
   }
@@ -240,7 +259,8 @@ class _HomePageState extends State<HomePage> {
         unselectedItemColor: Colors.blueGrey.shade300,
         items: const [
           BottomNavigationBarItem(icon: Icon(Icons.explore), label: "Map"),
-          BottomNavigationBarItem(icon: Icon(Icons.report_problem), label: "Reports"),
+          // ICON UPDATED: Changed from Icons.report_problem to Icons.notifications
+          BottomNavigationBarItem(icon: Icon(Icons.notifications), label: "Notifications"),
           BottomNavigationBarItem(icon: Icon(Icons.account_circle), label: "My Floote"),
         ],
       ),
