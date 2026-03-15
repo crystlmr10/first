@@ -1,21 +1,29 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart'; // 1. Added Dotenv
 import 'pages/login_page.dart';
 import 'pages/rescuer_login_page.dart';
 
-// --- ADD THIS GLOBAL KEY ---
-// This allows the A* engine to show the red reroute bar from anywhere in the app
+// --- GLOBAL KEY FOR ALERTS ---
 final GlobalKey<ScaffoldMessengerState> scaffoldMessengerKey =
     GlobalKey<ScaffoldMessengerState>();
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
+  // 2. Load Environment Variables (.env file)
+  // This ensures your Mapbox token isn't hardcoded
+  try {
+    await dotenv.load(fileName: ".env");
+  } catch (e) {
+    debugPrint("Warning: .env file not found. Make sure it exists in the root folder.");
+  }
+
+  // 3. Initialize Supabase
   await Supabase.initialize(
     url: 'https://ttsrktldvvqrgkfhsbbl.supabase.co/',
-    anonKey:
-        'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR0c3JrdGxkdnZxcmdrZmhzYmJsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI1NDYxODcsImV4cCI6MjA4ODEyMjE4N30.DkQAOtyA4gezkPFCWPtyoS2UKw2NYvZcAlsAWbql3QY',
+    anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR0c3JrdGxkdnZxcmdrZmhzYmJsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI1NDYxODcsImV4cCI6MjA4ODEyMjE4N30.DkQAOtyA4gezkPFCWPtyoS2UKw2NYvZcAlsAWbql3QY',
   );
 
   runApp(const FlooteApp());
@@ -27,14 +35,20 @@ class FlooteApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      // --- APPLY THE KEY HERE ---
+      // 4. Apply the Messenger Key
       scaffoldMessengerKey: scaffoldMessengerKey,
       debugShowCheckedModeBanner: false,
+      title: 'Floote',
+      theme: ThemeData(
+        useMaterial3: true,
+        primarySwatch: Colors.blue,
+      ),
       home: const FlooteOnboarding(),
     );
   }
 }
 
+// --- ONBOARDING UI (Kept your animated design) ---
 class FlooteOnboarding extends StatefulWidget {
   const FlooteOnboarding({super.key});
 
@@ -53,9 +67,7 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
 
   void _handleLogoTap() {
     _tapTimer?.cancel();
-    setState(() {
-      _tapCount++;
-    });
+    setState(() => _tapCount++);
 
     if (_tapCount == 5) {
       _tapCount = 0;
@@ -65,9 +77,7 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
       );
     } else {
       _tapTimer = Timer(const Duration(seconds: 2), () {
-        setState(() {
-          _tapCount = 0;
-        });
+        setState(() => _tapCount = 0);
       });
     }
   }
@@ -79,15 +89,13 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
       vsync: this,
       duration: const Duration(milliseconds: 3800),
     )..repeat(reverse: true);
+    
     _entryController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 900),
     )..forward();
 
-    _titleFade = CurvedAnimation(
-      parent: _entryController,
-      curve: Curves.easeOut,
-    );
+    _titleFade = CurvedAnimation(parent: _entryController, curve: Curves.easeOut);
     _titleSlide = Tween<Offset>(
       begin: const Offset(0, 0.07),
       end: Offset.zero,
@@ -107,6 +115,7 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
     return Scaffold(
       body: Stack(
         children: [
+          // Background Gradient
           Container(
             width: double.infinity,
             decoration: const BoxDecoration(
@@ -117,6 +126,8 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
               ),
             ),
           ),
+          
+          // Floating Animated Orbs
           AnimatedBuilder(
             animation: _bgController,
             builder: (context, child) {
@@ -125,23 +136,19 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
                   Positioned(
                     top: -90 + (40 * _bgController.value),
                     right: -50,
-                    child: _buildOrb(
-                      size: 240,
-                      color: Colors.cyanAccent.withAlpha(58),
-                    ),
+                    child: _buildOrb(size: 240, color: Colors.cyanAccent.withAlpha(58)),
                   ),
                   Positioned(
                     bottom: -110,
                     left: -30 + (25 * _bgController.value),
-                    child: _buildOrb(
-                      size: 280,
-                      color: Colors.lightBlueAccent.withAlpha(48),
-                    ),
+                    child: _buildOrb(size: 280, color: Colors.lightBlueAccent.withAlpha(48)),
                   ),
                 ],
               );
             },
           ),
+
+          // Main Content
           SafeArea(
             child: FadeTransition(
               opacity: _titleFade,
@@ -152,22 +159,7 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
                   child: Column(
                     children: [
                       const SizedBox(height: 34),
-                      GestureDetector(
-                        onTap: _handleLogoTap,
-                        child: Container(
-                          padding: const EdgeInsets.all(18),
-                          decoration: BoxDecoration(
-                            shape: BoxShape.circle,
-                            color: Colors.white.withAlpha(26),
-                            border: Border.all(color: Colors.white30),
-                          ),
-                          child: const Icon(
-                            Icons.waves,
-                            size: 56,
-                            color: Colors.white,
-                          ),
-                        ),
-                      ),
+                      _buildLogo(),
                       const SizedBox(height: 20),
                       const Text(
                         'Welcome to Floote',
@@ -176,7 +168,6 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
                           fontSize: 34,
                           fontWeight: FontWeight.w800,
                           color: Colors.white,
-                          letterSpacing: 0.3,
                         ),
                       ),
                       const SizedBox(height: 10),
@@ -186,50 +177,11 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
                         style: TextStyle(fontSize: 16, color: Colors.white70),
                       ),
                       const SizedBox(height: 28),
-                      _buildFeatureCard(
-                        Icons.location_on_outlined,
-                        'Live Flood Data',
-                        'Real-time updates from sensors in Talisay, Tabunok, and Minglanilla',
-                      ),
+                      _buildFeatureCard(Icons.location_on_outlined, 'Live Flood Data', 'Updates from sensors in Talisay, Tabunok, and Minglanilla'),
                       const SizedBox(height: 14),
-                      _buildFeatureCard(
-                        Icons.shield_outlined,
-                        'Safe Routes',
-                        'Navigate around flooded areas automatically',
-                      ),
-                      const SizedBox(height: 14),
-                      _buildFeatureCard(
-                        Icons.water_outlined,
-                        'Water Levels',
-                        'Know before you go with accurate depth readings',
-                      ),
+                      _buildFeatureCard(Icons.shield_outlined, 'Safe Routes', 'Navigate around flooded areas automatically'),
                       const Spacer(),
-                      SizedBox(
-                        width: double.infinity,
-                        height: 56,
-                        child: ElevatedButton(
-                          onPressed: () => Navigator.push(
-                            context,
-                            MaterialPageRoute(
-                              builder: (context) => const LoginPage(),
-                            ),
-                          ),
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.white,
-                            foregroundColor: const Color(0xFF0A4DD3),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(14),
-                            ),
-                          ),
-                          child: const Text(
-                            'Get Started',
-                            style: TextStyle(
-                              fontSize: 18,
-                              fontWeight: FontWeight.w800,
-                            ),
-                          ),
-                        ),
-                      ),
+                      _buildGetStartedButton(context),
                       const SizedBox(height: 24),
                     ],
                   ),
@@ -242,12 +194,39 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
     );
   }
 
-  Widget _buildOrb({required double size, required Color color}) {
-    return Container(
-      width: size,
-      height: size,
-      decoration: BoxDecoration(shape: BoxShape.circle, color: color),
+  Widget _buildLogo() {
+    return GestureDetector(
+      onTap: _handleLogoTap,
+      child: Container(
+        padding: const EdgeInsets.all(18),
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: Colors.white.withAlpha(26),
+          border: Border.all(color: Colors.white30),
+        ),
+        child: const Icon(Icons.waves, size: 56, color: Colors.white),
+      ),
     );
+  }
+
+  Widget _buildGetStartedButton(BuildContext context) {
+    return SizedBox(
+      width: double.infinity,
+      height: 56,
+      child: ElevatedButton(
+        onPressed: () => Navigator.push(context, MaterialPageRoute(builder: (context) => const LoginPage())),
+        style: ElevatedButton.styleFrom(
+          backgroundColor: Colors.white,
+          foregroundColor: const Color(0xFF0A4DD3),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        ),
+        child: const Text('Get Started', style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+      ),
+    );
+  }
+
+  Widget _buildOrb({required double size, required Color color}) {
+    return Container(width: size, height: size, decoration: BoxDecoration(shape: BoxShape.circle, color: color));
   }
 
   Widget _buildFeatureCard(IconData icon, String title, String desc) {
@@ -258,32 +237,14 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
         color: Colors.white.withAlpha(24),
         borderRadius: BorderRadius.circular(16),
         border: Border.all(color: Colors.white30),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withAlpha(28),
-            blurRadius: 14,
-            offset: const Offset(0, 6),
-          ),
-        ],
       ),
       child: Column(
         children: [
           Icon(icon, color: Colors.white, size: 28),
           const SizedBox(height: 12),
-          Text(
-            title,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 18,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
+          Text(title, style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold)),
           const SizedBox(height: 4),
-          Text(
-            desc,
-            textAlign: TextAlign.center,
-            style: const TextStyle(color: Colors.white70, fontSize: 13),
-          ),
+          Text(desc, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white70, fontSize: 13)),
         ],
       ),
     );

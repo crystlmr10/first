@@ -7,6 +7,7 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_typeahead/flutter_typeahead.dart';
 import 'emergency_page.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -36,8 +37,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   LatLng? _destinationPos;
 
   // MAPBOX CREDENTIALS
-  final String mapboxToken =
-      "pk.eyJ1IjoiY3J5c3RsbXIxMCIsImEiOiJjbW1yaDNsZ3cxOGZmMnJyMGpwNWFqbzY2In0.SkqpUCftXUJzU3z87DJgdw";
+  final String mapboxToken = dotenv.env['MAPBOX_TOKEN'] ?? "";
   final String mapboxStyleId = "mapbox/streets-v12";
 
   @override
