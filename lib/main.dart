@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart'; // 1. Added Dotenv
 import 'pages/login_page.dart';
 import 'pages/rescuer_login_page.dart';
 
@@ -11,14 +10,6 @@ final GlobalKey<ScaffoldMessengerState> scaffoldMessengerKey =
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-
-  // 2. Load Environment Variables (.env file)
-  // This ensures your Mapbox token isn't hardcoded
-  try {
-    await dotenv.load(fileName: ".env");
-  } catch (e) {
-    debugPrint("Warning: .env file not found. Make sure it exists in the root folder.");
-  }
 
   // 3. Initialize Supabase
   await Supabase.initialize(
@@ -180,6 +171,8 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
                       _buildFeatureCard(Icons.location_on_outlined, 'Live Flood Data', 'Updates from sensors in Talisay, Tabunok, and Minglanilla'),
                       const SizedBox(height: 14),
                       _buildFeatureCard(Icons.shield_outlined, 'Safe Routes', 'Navigate around flooded areas automatically'),
+                      const SizedBox(height: 14),
+                      _buildFeatureCard(Icons.water_drop_outlined, 'Water Level Alerts', 'Track rising levels and get warned before roads become impassable'),
                       const Spacer(),
                       _buildGetStartedButton(context),
                       const SizedBox(height: 24),

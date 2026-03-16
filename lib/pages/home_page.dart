@@ -7,7 +7,6 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_typeahead/flutter_typeahead.dart';
 import 'emergency_page.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -36,9 +35,12 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   List<LatLng> _routePoints = [];
   LatLng? _destinationPos;
 
-  // MAPBOX CREDENTIALS
-  final String mapboxToken = dotenv.env['MAPBOX_TOKEN'] ?? "";
-  final String mapboxStyleId = "mapbox/streets-v12";
+  static const String _mapboxToken = String.fromEnvironment(
+    'MAPBOX_TOKEN',
+    defaultValue: '',
+  );
+  static const String _mapboxStyleId = 'mapbox/streets-v12';
+  bool get _useMapbox => _mapboxToken.startsWith('pk.') && _mapboxToken.isNotEmpty;
 
   @override
   void initState() {
@@ -224,13 +226,19 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                   },
                 ),
                 children: [
-                  // MAPBOX TILE LAYER
-                  TileLayer(
-                    urlTemplate:
-                        'https://api.mapbox.com/styles/v1/$mapboxStyleId/tiles/256/{z}/{x}/{y}@2x?access_token=$mapboxToken',
-                    additionalOptions: {'accessToken': mapboxToken},
-                    userAgentPackageName: 'com.floote.app',
-                  ),
+                  if (_useMapbox)
+                    TileLayer(
+                      urlTemplate:
+                          'https://api.mapbox.com/styles/v1/$_mapboxStyleId/tiles/256/{z}/{x}/{y}@2x?access_token=$_mapboxToken',
+                      additionalOptions: const {'accessToken': _mapboxToken},
+                      userAgentPackageName: 'com.floote.app',
+                    )
+                  else
+                    TileLayer(
+                      urlTemplate:
+                          'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+                      userAgentPackageName: 'com.floote.app',
+                    ),
 
                   PolylineLayer(
                     polylines: [
@@ -353,13 +361,19 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                     ],
                   ),
 
-                  // REQUIRED MAPBOX ATTRIBUTION
                   RichAttributionWidget(
                     attributions: [
-                      TextSourceAttribution(
-                        'Mapbox',
-                        onTap: () => debugPrint('Mapbox source tapped'),
-                      ),
+                      if (_useMapbox)
+                        TextSourceAttribution(
+                          'Mapbox',
+                          onTap: () => debugPrint('Mapbox attribution tapped'),
+                        )
+                      else
+                        TextSourceAttribution(
+                          'OpenStreetMap contributors',
+                          onTap: () =>
+                              debugPrint('OpenStreetMap attribution tapped'),
+                        ),
                     ],
                   ),
                 ],
@@ -371,6 +385,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
           _buildTopSearchBar(),
           _buildStatusStrip(),
+          _buildWaterLevelStrip(),
           _buildSOSButton(),
           _buildFollowToggle(),
 
@@ -625,6 +640,112 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     );
   }
 
+  Widget _buildWaterLevelStrip() {
+    return StreamBuilder<List<Map<String, dynamic>>>(
+      stream: Supabase.instance.client
+          .from('user_reports')
+          .stream(primaryKey: ['id']),
+      builder: (context, snapshot) {
+        final reports = snapshot.data ?? const <Map<String, dynamic>>[];
+        final bestReport = _pickWaterLevelReport(reports);
+        if (bestReport == null) {
+          return const SizedBox.shrink();
+        }
+
+        final waterLevelCm = _readWaterLevelCm(bestReport);
+        final decision = (bestReport['admin_decision'] ?? '').toString();
+        final location =
+            (bestReport['location_name'] ?? 'Nearby area').toString();
+
+        final Color levelColor =
+            waterLevelCm >= 80 ? _dangerColor : (waterLevelCm >= 40 ? Colors.orangeAccent : _accentColor);
+
+        return Positioned(
+          top: MediaQuery.of(context).padding.top + 130,
+          left: 16,
+          right: 16,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+            decoration: BoxDecoration(
+              color: _panelColor.withAlpha(200),
+              borderRadius: BorderRadius.circular(16),
+              border: Border.all(color: Colors.white24),
+              boxShadow: const [
+                BoxShadow(
+                  color: Colors.black38,
+                  blurRadius: 18,
+                  offset: Offset(0, 8),
+                ),
+              ],
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.water_drop, color: levelColor, size: 20),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Water Level: ${waterLevelCm.toStringAsFixed(1)} cm',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 13,
+                          fontWeight: FontWeight.w700,
+                        ),
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        '$location • $decision',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          color: Colors.blueGrey.shade100,
+                          fontSize: 11,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  Map<String, dynamic>? _pickWaterLevelReport(List<Map<String, dynamic>> reports) {
+    if (reports.isEmpty) return null;
+
+    final withLevels = reports
+        .where((r) => _readWaterLevelCm(r) > 0)
+        .toList();
+    if (withLevels.isNotEmpty) {
+      withLevels.sort((a, b) => _readWaterLevelCm(b).compareTo(_readWaterLevelCm(a)));
+      return withLevels.first;
+    }
+
+    final impassable = reports.firstWhere(
+      (r) => (r['admin_decision'] ?? '').toString() == 'Impassable',
+      orElse: () => reports.first,
+    );
+    return impassable;
+  }
+
+  double _readWaterLevelCm(Map<String, dynamic> report) {
+    const keys = ['water_level_cm', 'water_level', 'depth_cm', 'flood_depth_cm'];
+    for (final key in keys) {
+      final value = report[key];
+      if (value is num) return value.toDouble();
+      if (value is String) {
+        final parsed = double.tryParse(value);
+        if (parsed != null) return parsed;
+      }
+    }
+    return 0;
+  }
+
   void _showReportDetails(Map<String, dynamic> report) {
     showModalBottomSheet(
       context: context,
@@ -701,36 +822,61 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     return Colors.transparent;
   }
 
-  // --- UPDATED MAPBOX SEARCH LOGIC ---
+  // Search destinations with Mapbox when a token is provided; otherwise use OSM.
   Future<List<Map<String, dynamic>>> _getSearchSuggestions(String query) async {
     if (query.length < 3) return [];
 
-    // Using Mapbox Geocoding API for better Cebu street coverage
-    final String url =
-        'https://api.mapbox.com/geocoding/v5/mapbox.places/$query.json?'
-        'access_token=$mapboxToken&'
-        'proximity=${_currentPCPos?.longitude},${_currentPCPos?.latitude}&' // Prioritizes nearby results
-        'bbox=123.75,10.22,124.0,10.45&' // Focus strictly on Cebu area
-        'country=ph&limit=10';
-
     try {
-      final response = await http.get(Uri.parse(url));
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        final List features = data['features'];
+      if (_useMapbox) {
+        final encodedQuery = Uri.encodeComponent(query);
+        final String mapboxUrl =
+            'https://api.mapbox.com/geocoding/v5/mapbox.places/$encodedQuery.json?'
+            'access_token=$_mapboxToken&'
+            'proximity=${_currentPCPos?.longitude},${_currentPCPos?.latitude}&'
+            'bbox=123.75,10.22,124.0,10.45&country=ph&limit=10';
 
-        return features
-            .map(
-              (f) => {
-                'display_name': f['place_name'],
-                'lat': f['geometry']['coordinates'][1],
-                'lon': f['geometry']['coordinates'][0],
-              },
-            )
-            .toList();
+        final mapboxResponse = await http.get(Uri.parse(mapboxUrl));
+        if (mapboxResponse.statusCode == 200) {
+          final data = json.decode(mapboxResponse.body);
+          final List features = data['features'];
+          return features
+              .map(
+                (f) => {
+                  'display_name': f['place_name'],
+                  'lat': f['geometry']['coordinates'][1].toString(),
+                  'lon': f['geometry']['coordinates'][0].toString(),
+                },
+              )
+              .toList();
+        }
+      } else {
+        final encodedQuery = Uri.encodeComponent(query);
+        final String nominatimUrl =
+            'https://nominatim.openstreetmap.org/search?'
+            'q=$encodedQuery&format=jsonv2&limit=10&countrycodes=ph&'
+            'viewbox=123.75,10.45,124.0,10.22&bounded=1';
+
+        final response = await http.get(
+          Uri.parse(nominatimUrl),
+          headers: const {
+            'User-Agent': 'floote-app/1.0 (flutter_map_search)',
+          },
+        );
+        if (response.statusCode == 200) {
+          final List data = json.decode(response.body);
+          return data
+              .map(
+                (f) => {
+                  'display_name': f['display_name'],
+                  'lat': f['lat'],
+                  'lon': f['lon'],
+                },
+              )
+              .toList();
+        }
       }
     } catch (e) {
-      debugPrint("Mapbox Search Error: $e");
+      debugPrint("Search provider error: $e");
     }
     return [];
   }
