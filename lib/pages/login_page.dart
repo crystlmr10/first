@@ -1,3 +1,4 @@
+import 'dart:async'; // CRITICAL: This fixes the TimeoutException error
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'register_page.dart';
@@ -52,10 +53,24 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
 
     try {
       // Authenticate with Supabase
-      await Supabase.instance.client.auth.signInWithPassword(
-        email: _emailController.text.trim(),
-        password: _passwordController.text.trim(),
-      );
+      final response = await Supabase.instance.client.auth
+          .signInWithPassword(
+            email: _emailController.text.trim(),
+            password: _passwordController.text.trim(),
+          )
+          .timeout(const Duration(seconds: 15));
+
+      if (response.user == null) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Login failed. Please try again.'),
+              backgroundColor: Colors.redAccent,
+            ),
+          );
+        }
+        return;
+      }
 
       if (mounted) {
         Navigator.pushReplacement(
@@ -65,13 +80,25 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
           ),
         );
       }
+    } on TimeoutException {
+      // Caught because dart:async is now imported
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('Login timed out. Check your connection.'),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+      }
     } on AuthException catch (e) {
+      // Specific Supabase auth errors (e.g., invalid credentials)
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text(e.message), backgroundColor: Colors.redAccent),
         );
       }
     } catch (e) {
+      // Fallback for any other unexpected errors
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('An unexpected error occurred')),
@@ -124,16 +151,15 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
                 curve: Curves.easeOut,
               ),
               child: SlideTransition(
-                position:
-                    Tween<Offset>(
-                      begin: const Offset(0, 0.05),
-                      end: Offset.zero,
-                    ).animate(
-                      CurvedAnimation(
-                        parent: _entryController,
-                        curve: Curves.easeOut,
-                      ),
-                    ),
+                position: Tween<Offset>(
+                  begin: const Offset(0, 0.05),
+                  end: Offset.zero,
+                ).animate(
+                  CurvedAnimation(
+                    parent: _entryController,
+                    curve: Curves.easeOut,
+                  ),
+                ),
                 child: SingleChildScrollView(
                   padding: const EdgeInsets.symmetric(horizontal: 24.0),
                   child: Column(
