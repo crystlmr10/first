@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:latlong2/latlong.dart';
@@ -22,14 +23,18 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   static const Color _accentColor = Color(0xFF00E4FF);
   static const Color _dangerColor = Color(0xFFFF4C4C);
   static const Color _panelColor = Color(0xFF111A24);
+  static const LatLng _cituLocation = LatLng(10.297438, 123.876313);
+  static const bool _useFixedCurrentLocation = true;
 
   late final AnimationController _pulseController;
   late final AnimationController _sosController;
   bool _isAutoCentering = false;
   bool _isRerouting = false;
   bool _pathIsBlocked = false;
+  bool _isFloodWarningAhead = false;
+  List<Map<String, dynamic>> _cachedVerifiedReports = const [];
 
-  LatLng? _currentPCPos;
+  LatLng? _currentPCPos = _cituLocation;
   double _currentHeading = 0.0;
 
   List<LatLng> _routePoints = [];
@@ -64,31 +69,62 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     super.dispose();
   }
 
+  double? _toDouble(dynamic value) {
+    if (value is num) return value.toDouble();
+    if (value is String) return double.tryParse(value.trim());
+    return null;
+  }
+
+  List<Map<String, dynamic>> _normalizeVerifiedReports(
+    List<Map<String, dynamic>> allReports,
+  ) {
+    final normalized = <Map<String, dynamic>>[];
+    for (final r in allReports) {
+      final decision = (r['admin_decision'] ?? '').toString().trim();
+      if (decision != 'Impassable' && decision != 'Risky') continue;
+      final lat = _toDouble(r['latitude']);
+      final lng = _toDouble(r['longitude']);
+      if (lat == null || lng == null) continue;
+
+      normalized.add({...r, 'latitude': lat, 'longitude': lng});
+    }
+    return normalized;
+  }
+
   // --- 1. DETECT IF CURRENT PATH HAS HAZARDS ---
   void _checkRouteForFloods(List<Map<String, dynamic>> reports) {
     if (_routePoints.isEmpty || _destinationPos == null || _isRerouting) return;
 
     const Distance distance = Distance();
     bool hazardFound = false;
+    bool warningFound = false;
 
     for (var point in _routePoints) {
       for (var report in reports) {
-        if (report['admin_decision'] == 'Impassable') {
-          double d = distance.as(
-            LengthUnit.Meter,
-            point,
-            LatLng(report['latitude'], report['longitude']),
-          );
-          if (d < 150) {
-            hazardFound = true;
-            break;
-          }
+        final decision = (report['admin_decision'] ?? '').toString();
+        final d = distance.as(
+          LengthUnit.Meter,
+          point,
+          LatLng(report['latitude'], report['longitude']),
+        );
+
+        if (decision == 'Impassable' && d < 150) {
+          hazardFound = true;
+          break;
+        }
+
+        if (decision == 'Risky' && d < 80) {
+          warningFound = true;
         }
       }
+      if (hazardFound) break;
     }
 
-    if (hazardFound != _pathIsBlocked) {
-      setState(() => _pathIsBlocked = hazardFound);
+    if (hazardFound != _pathIsBlocked || warningFound != _isFloodWarningAhead) {
+      setState(() {
+        _pathIsBlocked = hazardFound;
+        _isFloodWarningAhead = warningFound;
+      });
     }
   }
 
@@ -124,57 +160,662 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     }
   }
 
-  // --- 3. PYTHON A* ALTERNATE ROUTE ---
+  // --- 3. FASTAPI FLOOD-AWARE REROUTE ---
   Future<void> _getSafeAStarRoute(
-    List<Map<String, dynamic>> verifiedReports,
+    List<Map<String, dynamic>> _verifiedReports,
   ) async {
     if (_currentPCPos == null || _destinationPos == null) return;
 
     setState(() => _isRerouting = true);
 
-    final blockedNodes = verifiedReports
-        .where((r) => r['admin_decision'] == 'Impassable')
-        .map((r) => {"lat": r['latitude'], "lng": r['longitude']})
+    // Use emulator loopback by default. Override using:
+    // flutter run --dart-define=ROUTING_API_URL=http://<your-ip>:8000/route
+    const String apiUrlOverride = String.fromEnvironment('ROUTING_API_URL');
+    final String apiUrl = apiUrlOverride.isNotEmpty
+        ? apiUrlOverride
+        : (kIsWeb
+              ? 'http://127.0.0.1:8000/route'
+              : 'http://10.0.2.2:8000/route');
+
+    // Build a lightweight dynamic graph from current route geometry.
+    // This lets FastAPI run safety checks using live Supabase flood reports.
+    final List<LatLng> seedPoints = [];
+    seedPoints.add(_currentPCPos!);
+
+    if (_routePoints.length > 2) {
+      final step = (_routePoints.length / 24).ceil().clamp(1, 10);
+      for (int i = step; i < _routePoints.length - 1; i += step) {
+        seedPoints.add(_routePoints[i]);
+      }
+    }
+
+    seedPoints.add(_destinationPos!);
+
+    final hazardPoints = _verifiedReports
+        .where((r) => (r['admin_decision'] ?? '').toString() == 'Impassable')
+        .where((r) => r['latitude'] is num && r['longitude'] is num)
+        .map(
+          (r) => LatLng(
+            (r['latitude'] as num).toDouble(),
+            (r['longitude'] as num).toDouble(),
+          ),
+        )
         .toList();
 
-    // UPDATE TO YOUR CURRENT IP: 172.20.10.3
-    const String laptopIp = "172.20.10.3";
-    const String pythonServerUrl = 'http://$laptopIp:5000/astar_safe_route';
+    final attemptConfigs = <Map<String, dynamic>>[
+      {'maxLane': 2, 'laneStepMeters': 180.0},
+      {'maxLane': 3, 'laneStepMeters': 230.0},
+      {'maxLane': 4, 'laneStepMeters': 280.0},
+    ];
 
-    try {
-      final response = await http.post(
-        Uri.parse(pythonServerUrl),
-        headers: {"Content-Type": "application/json"},
-        body: json.encode({
-          "start": [_currentPCPos!.latitude, _currentPCPos!.longitude],
-          "end": [_destinationPos!.latitude, _destinationPos!.longitude],
-          "blocked_nodes": blockedNodes,
-        }),
+    String lastError = "No safe route found";
+    bool connected = false;
+
+    for (int attempt = 0; attempt < attemptConfigs.length; attempt++) {
+      final cfg = attemptConfigs[attempt];
+      final payload = _buildDetourPayload(
+        seedPoints,
+        maxLane: cfg['maxLane'] as int,
+        laneStepMeters: cfg['laneStepMeters'] as double,
       );
 
-      if (response.statusCode == 200 && mounted) {
+      try {
+        final response = await http.post(
+          Uri.parse(apiUrl),
+          headers: {"Content-Type": "application/json"},
+          body: json.encode(payload),
+        );
+        connected = true;
+
+        if (response.statusCode != 200) {
+          lastError = "Routing API error: ${response.statusCode}";
+          continue;
+        }
+
         final data = json.decode(response.body);
-        if (data['status'] == 'success') {
-          final List coords = data['points'];
-          setState(() {
-            _routePoints = coords.map((c) => LatLng(c[0], c[1])).toList();
-            _isRerouting = false;
-            _pathIsBlocked = false;
-          });
-        } else {
-          setState(() => _isRerouting = false);
-          ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(
-              content: Text(data['message'] ?? "No path found"),
-              backgroundColor: Colors.red,
-            ),
-          );
+        final status = (data['status'] ?? '').toString();
+        if (status != 'safe' && status != 'rerouted') {
+          lastError = (data['message'] ?? "No safe route found").toString();
+          continue;
+        }
+
+        final List coords = (data['polyline'] ?? []) as List;
+        if (coords.isEmpty) {
+          lastError = "Routing service returned empty polyline.";
+          continue;
+        }
+
+        final backendPolyline = coords
+            .where((c) => c is Map && c['lat'] is num && c['lng'] is num)
+            .map<LatLng>(
+              (c) => LatLng(
+                (c['lat'] as num).toDouble(),
+                (c['lng'] as num).toDouble(),
+              ),
+            )
+            .toList();
+
+        if (backendPolyline.length < 2) {
+          lastError = "Routing service returned invalid polyline.";
+          continue;
+        }
+
+        final shapedPolyline = await _shapePolylineOnRoads(
+          backendPolyline,
+          hazardPoints,
+        );
+
+        if (shapedPolyline.isEmpty) {
+          lastError = "No road-following reroute found.";
+          continue;
+        }
+        if (_routeIntersectsHazards(shapedPolyline, hazardPoints, 150.0)) {
+          lastError = "No safe reroute found outside 150m hazard radius.";
+          continue;
+        }
+
+        final cleaned = _removeDeadEndLoops(shapedPolyline);
+        if (cleaned.length < 2) {
+          lastError = "No road-following reroute found.";
+          continue;
+        }
+
+        if (!mounted) return;
+        setState(() {
+          _routePoints = cleaned;
+          _isRerouting = false;
+          _pathIsBlocked = false;
+          _isFloodWarningAhead = false;
+        });
+        _mapController.fitCamera(
+          CameraFit.bounds(
+            bounds: LatLngBounds.fromPoints(_routePoints),
+            padding: const EdgeInsets.all(70.0),
+          ),
+        );
+        return;
+      } catch (e) {
+        debugPrint("FastAPI route error (attempt ${attempt + 1}): $e");
+        lastError = "Cannot connect to routing backend.";
+        break;
+      }
+    }
+
+    // Final fallback: try a bypass corridor route with offset waypoints.
+    final bypassRoute = await _shapeViaBypassCorridor(
+      _currentPCPos!,
+      _destinationPos!,
+      hazardPoints,
+    );
+    if (bypassRoute.isNotEmpty && mounted) {
+      setState(() {
+        _routePoints = _removeDeadEndLoops(bypassRoute);
+        _isRerouting = false;
+        _pathIsBlocked = false;
+        _isFloodWarningAhead = false;
+      });
+      _mapController.fitCamera(
+        CameraFit.bounds(
+          bounds: LatLngBounds.fromPoints(_routePoints),
+          padding: const EdgeInsets.all(70.0),
+        ),
+      );
+      return;
+    }
+
+    if (!mounted) return;
+    setState(() => _isRerouting = false);
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          connected
+              ? "$lastError Tried wider detour but no valid safe route."
+              : lastError,
+        ),
+        backgroundColor: Colors.red,
+      ),
+    );
+  }
+
+  Map<String, dynamic> _buildDetourPayload(
+    List<LatLng> seedPoints, {
+    required int maxLane,
+    required double laneStepMeters,
+  }) {
+    const Distance dist = Distance();
+    final Map<String, dynamic> payloadNodes = {};
+    final Map<String, List<Map<String, dynamic>>> payloadGraph = {};
+
+    String nodeId(int lane, int idx) => 'L${lane}_$idx';
+    double laneOffsetMeters(int lane) => laneStepMeters * lane.abs();
+
+    LatLng lanePoint(int lane, int idx) {
+      final base = seedPoints[idx];
+      if (lane == 0) return base;
+      final prev = seedPoints[idx == 0 ? idx : idx - 1];
+      final next = seedPoints[idx == seedPoints.length - 1 ? idx : idx + 1];
+      final bearing = dist.bearing(prev, next);
+      final offsetBearing = lane < 0 ? bearing - 90.0 : bearing + 90.0;
+      return dist.offset(base, laneOffsetMeters(lane), offsetBearing);
+    }
+
+    for (int lane = -maxLane; lane <= maxLane; lane++) {
+      for (int i = 0; i < seedPoints.length; i++) {
+        final p = lanePoint(lane, i);
+        final id = nodeId(lane, i);
+        payloadNodes[id] = {'lat': p.latitude, 'lng': p.longitude};
+        payloadGraph[id] = [];
+      }
+    }
+
+    void addEdgeById(String fromId, String toId) {
+      final from = payloadNodes[fromId];
+      final to = payloadNodes[toId];
+      if (from == null || to == null) return;
+      final fromPos = LatLng(
+        (from['lat'] as num).toDouble(),
+        (from['lng'] as num).toDouble(),
+      );
+      final toPos = LatLng(
+        (to['lat'] as num).toDouble(),
+        (to['lng'] as num).toDouble(),
+      );
+      final d = dist.as(LengthUnit.Meter, fromPos, toPos);
+      payloadGraph[fromId]!.add({
+        'to': toId,
+        'distance': d,
+        'flood_depth': 0,
+        'impassable_sign': false,
+      });
+    }
+
+    for (int lane = -maxLane; lane <= maxLane; lane++) {
+      for (int i = 0; i < seedPoints.length - 1; i++) {
+        final a = nodeId(lane, i);
+        final b = nodeId(lane, i + 1);
+        addEdgeById(a, b);
+        addEdgeById(b, a);
+      }
+    }
+
+    for (int i = 0; i < seedPoints.length; i++) {
+      for (int lane = -maxLane; lane < maxLane; lane++) {
+        addEdgeById(nodeId(lane, i), nodeId(lane + 1, i));
+        addEdgeById(nodeId(lane + 1, i), nodeId(lane, i));
+      }
+      if (i < seedPoints.length - 1) {
+        for (int lane = -maxLane; lane <= maxLane; lane++) {
+          if (lane - 1 >= -maxLane) {
+            addEdgeById(nodeId(lane, i), nodeId(lane - 1, i + 1));
+          }
+          if (lane + 1 <= maxLane) {
+            addEdgeById(nodeId(lane, i), nodeId(lane + 1, i + 1));
+          }
         }
       }
-    } catch (e) {
-      if (mounted) setState(() => _isRerouting = false);
-      debugPrint("A* Connection Error: $e");
     }
+
+    return {
+      "start": nodeId(0, 0),
+      "goal": nodeId(0, seedPoints.length - 1),
+      "nodes": payloadNodes,
+      "graph": payloadGraph,
+    };
+  }
+
+  Future<List<LatLng>> _shapePolylineOnRoads(
+    List<LatLng> controlPoints,
+    List<LatLng> hazardPoints,
+  ) async {
+    if (controlPoints.length < 2) return controlPoints;
+
+    // Keep request size reasonable while preserving route shape.
+    final reduced = <LatLng>[];
+    final step = (controlPoints.length / 30).ceil().clamp(1, 4);
+    for (int i = 0; i < controlPoints.length; i += step) {
+      reduced.add(controlPoints[i]);
+    }
+    if (reduced.last != controlPoints.last) {
+      reduced.add(controlPoints.last);
+    }
+
+    // Snap control points to nearest drivable road first to improve segment routing.
+    final snapped = <LatLng>[];
+    for (final p in reduced) {
+      snapped.add(await _snapToNearestRoad(p));
+    }
+
+    final stitched = <LatLng>[];
+    bool segmentFailed = false;
+
+    try {
+      // Route each segment separately to reduce odd global loops/dead-ends.
+      for (int i = 0; i < snapped.length - 1; i++) {
+        final a = snapped[i];
+        final b = snapped[i + 1];
+        final segUrl = Uri.parse(
+          'https://router.project-osrm.org/route/v1/driving/'
+          '${a.longitude},${a.latitude};${b.longitude},${b.latitude}'
+          '?overview=full&geometries=geojson',
+        );
+        final response = await http.get(segUrl);
+        if (response.statusCode != 200) {
+          debugPrint('OSRM segment shaping failed: ${response.statusCode}');
+          segmentFailed = true;
+          break;
+        }
+        final data = json.decode(response.body);
+        final routes = data['routes'];
+        if (routes is! List || routes.isEmpty) {
+          segmentFailed = true;
+          break;
+        }
+        final coordinates = routes[0]['geometry']['coordinates'];
+        if (coordinates is! List || coordinates.isEmpty) {
+          segmentFailed = true;
+          break;
+        }
+
+        final segPoints = coordinates
+            .map<LatLng>(
+              (c) => LatLng((c[1] as num).toDouble(), (c[0] as num).toDouble()),
+            )
+            .toList();
+
+        if (stitched.isEmpty) {
+          stitched.addAll(segPoints);
+        } else {
+          // avoid duplicate join point between consecutive segments
+          stitched.addAll(segPoints.skip(1));
+        }
+      }
+
+      if (!segmentFailed && stitched.isNotEmpty) {
+        if (_routeIntersectsHazards(stitched, hazardPoints, 150.0)) {
+          // Try a waypoint-based fallback if stitched path clips hazard radius.
+          final viaWaypoint = await _shapeViaSafeWaypoint(
+            snapped,
+            hazardPoints,
+          );
+          if (viaWaypoint.isNotEmpty) {
+            return viaWaypoint;
+          }
+          return _shapeDirectRoadRoute(
+            snapped.first,
+            snapped.last,
+            hazardPoints,
+          );
+        }
+        return stitched;
+      }
+
+      // Segment chain failed: fallback through one "safest" waypoint.
+      final viaWaypoint = await _shapeViaSafeWaypoint(snapped, hazardPoints);
+      if (viaWaypoint.isNotEmpty) {
+        return viaWaypoint;
+      }
+      return _shapeDirectRoadRoute(
+        snapped.first,
+        snapped.last,
+        hazardPoints,
+      );
+    } catch (e) {
+      debugPrint('OSRM shaping error: $e');
+      final viaWaypoint = await _shapeViaSafeWaypoint(snapped, hazardPoints);
+      if (viaWaypoint.isNotEmpty) {
+        return viaWaypoint;
+      }
+      return _shapeDirectRoadRoute(
+        snapped.first,
+        snapped.last,
+        hazardPoints,
+      );
+    }
+  }
+
+  Future<List<LatLng>> _shapeDirectRoadRoute(
+    LatLng start,
+    LatLng end,
+    List<LatLng> hazards,
+  ) async {
+    final url = Uri.parse(
+      'https://router.project-osrm.org/route/v1/driving/'
+      '${start.longitude},${start.latitude};${end.longitude},${end.latitude}'
+      '?overview=full&geometries=geojson',
+    );
+    try {
+      final response = await http.get(url);
+      if (response.statusCode != 200) return [];
+      final data = json.decode(response.body);
+      final routes = data['routes'];
+      if (routes is! List || routes.isEmpty) return [];
+      final coordinates = routes[0]['geometry']['coordinates'];
+      if (coordinates is! List || coordinates.isEmpty) return [];
+      final route = coordinates
+          .map<LatLng>(
+            (c) => LatLng((c[1] as num).toDouble(), (c[0] as num).toDouble()),
+          )
+          .toList();
+      if (_routeIntersectsHazards(route, hazards, 150.0)) return [];
+      return route;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<List<LatLng>> _shapeViaBypassCorridor(
+    LatLng start,
+    LatLng end,
+    List<LatLng> hazards,
+  ) async {
+    const Distance dist = Distance();
+    final baseBearing = dist.bearing(start, end);
+    final leftBearing = baseBearing - 90.0;
+    final rightBearing = baseBearing + 90.0;
+
+    final candidates = <List<LatLng>>[];
+    for (final offset in [250.0, 350.0, 500.0, 650.0]) {
+      for (final side in [leftBearing, rightBearing]) {
+        final p1 = _interpolateLatLng(start, end, 0.35);
+        final p2 = _interpolateLatLng(start, end, 0.70);
+        candidates.add([
+          await _snapToNearestRoad(start),
+          await _snapToNearestRoad(dist.offset(p1, offset, side)),
+          await _snapToNearestRoad(dist.offset(p2, offset, side)),
+          await _snapToNearestRoad(end),
+        ]);
+      }
+    }
+
+    for (final c in candidates) {
+      final url = Uri.parse(
+        'https://router.project-osrm.org/route/v1/driving/'
+        '${c[0].longitude},${c[0].latitude};'
+        '${c[1].longitude},${c[1].latitude};'
+        '${c[2].longitude},${c[2].latitude};'
+        '${c[3].longitude},${c[3].latitude}'
+        '?overview=full&geometries=geojson',
+      );
+      try {
+        final response = await http.get(url);
+        if (response.statusCode != 200) continue;
+        final data = json.decode(response.body);
+        final routes = data['routes'];
+        if (routes is! List || routes.isEmpty) continue;
+        final coordinates = routes[0]['geometry']['coordinates'];
+        if (coordinates is! List || coordinates.isEmpty) continue;
+        final route = coordinates
+            .map<LatLng>(
+              (v) => LatLng((v[1] as num).toDouble(), (v[0] as num).toDouble()),
+            )
+            .toList();
+        if (!_routeIntersectsHazards(route, hazards, 150.0)) {
+          return route;
+        }
+      } catch (_) {
+        continue;
+      }
+    }
+    return [];
+  }
+
+  LatLng _interpolateLatLng(LatLng a, LatLng b, double t) {
+    return LatLng(
+      a.latitude + (b.latitude - a.latitude) * t,
+      a.longitude + (b.longitude - a.longitude) * t,
+    );
+  }
+
+  Future<List<LatLng>> _shapeViaSafeWaypoint(
+    List<LatLng> points,
+    List<LatLng> hazards,
+  ) async {
+    if (points.length < 3) return [];
+    const Distance dist = Distance();
+
+    // Pick the internal point that is farthest from all hazards.
+    LatLng? best;
+    double bestScore = -1.0;
+    final start = points.first;
+    final end = points.last;
+
+    for (int i = 1; i < points.length - 1; i++) {
+      final p = points[i];
+      final fromStart = dist.as(LengthUnit.Meter, start, p);
+      final toEnd = dist.as(LengthUnit.Meter, p, end);
+      if (fromStart < 120 || toEnd < 120) continue;
+
+      double minHz = double.infinity;
+      for (final hz in hazards) {
+        final d = dist.as(LengthUnit.Meter, p, hz);
+        if (d < minHz) minHz = d;
+      }
+      if (hazards.isEmpty) minHz = 999999;
+      if (minHz > bestScore) {
+        bestScore = minHz;
+        best = p;
+      }
+    }
+
+    if (best == null) return [];
+
+    final url = Uri.parse(
+      'https://router.project-osrm.org/route/v1/driving/'
+      '${start.longitude},${start.latitude};'
+      '${best.longitude},${best.latitude};'
+      '${end.longitude},${end.latitude}'
+      '?overview=full&geometries=geojson',
+    );
+    try {
+      final response = await http.get(url);
+      if (response.statusCode != 200) return [];
+      final data = json.decode(response.body);
+      final routes = data['routes'];
+      if (routes is! List || routes.isEmpty) return [];
+      final coordinates = routes[0]['geometry']['coordinates'];
+      if (coordinates is! List || coordinates.isEmpty) return [];
+      final route = coordinates
+          .map<LatLng>(
+            (c) => LatLng((c[1] as num).toDouble(), (c[0] as num).toDouble()),
+          )
+          .toList();
+      if (_routeIntersectsHazards(route, hazards, 150.0)) return [];
+      return route;
+    } catch (_) {
+      return [];
+    }
+  }
+
+  Future<LatLng> _snapToNearestRoad(LatLng point) async {
+    final url = Uri.parse(
+      'https://router.project-osrm.org/nearest/v1/driving/'
+      '${point.longitude},${point.latitude}?number=1',
+    );
+    try {
+      final response = await http.get(url);
+      if (response.statusCode != 200) return point;
+      final data = json.decode(response.body);
+      final waypoints = data['waypoints'];
+      if (waypoints is! List || waypoints.isEmpty) return point;
+      final location = waypoints[0]['location'];
+      if (location is! List || location.length < 2) return point;
+      return LatLng(
+        (location[1] as num).toDouble(),
+        (location[0] as num).toDouble(),
+      );
+    } catch (_) {
+      return point;
+    }
+  }
+
+  bool _routeIntersectsHazards(
+    List<LatLng> route,
+    List<LatLng> hazards,
+    double radiusMeters,
+  ) {
+    if (route.length < 2 || hazards.isEmpty) return false;
+    const Distance dist = Distance();
+
+    for (int i = 0; i < route.length - 1; i++) {
+      final a = route[i];
+      final b = route[i + 1];
+      final segmentLength = dist.as(LengthUnit.Meter, a, b);
+      final samples = (segmentLength / 20.0).ceil().clamp(1, 40);
+
+      for (int s = 0; s <= samples; s++) {
+        final t = s / samples;
+        final sample = LatLng(
+          a.latitude + (b.latitude - a.latitude) * t,
+          a.longitude + (b.longitude - a.longitude) * t,
+        );
+        for (final hz in hazards) {
+          if (dist.as(LengthUnit.Meter, sample, hz) <= radiusMeters) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  List<LatLng> _removeDeadEndLoops(List<LatLng> points) {
+    if (points.length < 3) return points;
+    const Distance dist = Distance();
+    final cleaned = <LatLng>[points.first];
+
+    for (int i = 1; i < points.length - 1; i++) {
+      final prev = cleaned.last;
+      final current = points[i];
+      final next = points[i + 1];
+      final prevToCurrent = dist.as(LengthUnit.Meter, prev, current);
+      final currentToNext = dist.as(LengthUnit.Meter, current, next);
+      final prevToNext = dist.as(LengthUnit.Meter, prev, next);
+
+      // If this point creates a tiny out-and-back detour, skip it.
+      final isLoopish = prevToCurrent < 45 &&
+          currentToNext < 45 &&
+          prevToNext < 30;
+      if (!isLoopish) cleaned.add(current);
+    }
+
+    cleaned.add(points.last);
+    return _prunePolylineLoops(cleaned);
+  }
+
+  List<LatLng> _prunePolylineLoops(List<LatLng> points) {
+    if (points.length < 4) return points;
+    const Distance dist = Distance();
+    final output = List<LatLng>.from(points);
+
+    // Pass 1: remove branch-like loops where path comes back near an older point.
+    bool changed = true;
+    int guard = 0;
+    while (changed && output.length > 6 && guard < 5) {
+      changed = false;
+      guard++;
+      bool broke = false;
+
+      for (int i = 0; i < output.length - 8; i++) {
+        for (int j = i + 6; j < output.length - 1; j++) {
+          final nearReturn = dist.as(LengthUnit.Meter, output[i], output[j]) < 60;
+          if (!nearReturn) continue;
+
+          double branchLength = 0;
+          for (int k = i; k < j; k++) {
+            branchLength += dist.as(LengthUnit.Meter, output[k], output[k + 1]);
+          }
+
+          // Drop only local detour branches, keep long legitimate route sections.
+          if (branchLength < 700) {
+            output.removeRange(i + 1, j);
+            changed = true;
+            broke = true;
+            break;
+          }
+        }
+        if (broke) break;
+      }
+    }
+
+    // Final pass: remove obvious sharp out-and-back zigzags.
+    if (output.length < 3) return output;
+    final finalClean = <LatLng>[output.first];
+    for (int i = 1; i < output.length - 1; i++) {
+      final a = finalClean.last;
+      final b = output[i];
+      final c = output[i + 1];
+
+      final ab = dist.as(LengthUnit.Meter, a, b);
+      final bc = dist.as(LengthUnit.Meter, b, c);
+      final ac = dist.as(LengthUnit.Meter, a, c);
+      final isBacktrackSpike = ab < 140 && bc < 140 && ac < 55;
+
+      if (!isBacktrackSpike) {
+        finalClean.add(b);
+      }
+    }
+    finalClean.add(output.last);
+    return finalClean;
   }
 
   void _clearRoute() {
@@ -182,6 +823,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       _routePoints = [];
       _destinationPos = null;
       _pathIsBlocked = false;
+      _isFloodWarningAhead = false;
       _isRerouting = false;
       _searchController.clear();
       _isAutoCentering = true;
@@ -201,23 +843,31 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                 .stream(primaryKey: ['id']),
             builder: (context, reportSnapshot) {
               final allReports = reportSnapshot.data ?? [];
-              final verifiedReports = allReports
-                  .where(
-                    (r) =>
-                        r['admin_decision'] == 'Impassable' ||
-                        r['admin_decision'] == 'Risky',
-                  )
-                  .toList();
+              final verifiedReports = _normalizeVerifiedReports(allReports);
+
+              // Keep warnings persistent even if stream briefly returns empty.
+              final displayReports = verifiedReports.isNotEmpty
+                  ? verifiedReports
+                  : _cachedVerifiedReports;
+              if (verifiedReports.isNotEmpty &&
+                  verifiedReports.length != _cachedVerifiedReports.length) {
+                WidgetsBinding.instance.addPostFrameCallback((_) {
+                  if (mounted) {
+                    setState(() {
+                      _cachedVerifiedReports = verifiedReports;
+                    });
+                  }
+                });
+              }
 
               WidgetsBinding.instance.addPostFrameCallback(
-                (_) => _checkRouteForFloods(verifiedReports),
+                (_) => _checkRouteForFloods(displayReports),
               );
 
               return FlutterMap(
                 mapController: _mapController,
                 options: MapOptions(
-                  initialCenter:
-                      _currentPCPos ?? const LatLng(10.2685, 123.8402),
+                  initialCenter: _currentPCPos ?? _cituLocation,
                   initialZoom: 15.0,
                   onPositionChanged: (pos, hasGesture) {
                     if (hasGesture && _isAutoCentering) {
@@ -251,12 +901,13 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                         borderColor: Colors.black.withAlpha(80),
                         borderStrokeWidth: 1.2,
                       ),
+                      ..._buildHazardRadiusRings(displayReports),
                     ],
                   ),
 
                   MarkerLayer(
                     markers: [
-                      ...verifiedReports.map(
+                      ...displayReports.map(
                         (r) => Marker(
                           point: LatLng(r['latitude'], r['longitude']),
                           width: 52,
@@ -388,6 +1039,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
           _buildWaterLevelStrip(),
           _buildSOSButton(),
           _buildFollowToggle(),
+          _buildZoomControls(),
 
           // WARNING BAR (RED)
           AnimatedPositioned(
@@ -401,7 +1053,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                 final response = await Supabase.instance.client
                     .from('user_reports')
                     .select();
-                final reports = List<Map<String, dynamic>>.from(response);
+                final reports = _normalizeVerifiedReports(
+                  List<Map<String, dynamic>>.from(response),
+                );
                 _getSafeAStarRoute(reports);
               },
               child: Container(
@@ -456,8 +1110,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
   // --- HELPER METHODS ---
   Widget _buildMapMoodOverlay() {
-    return IgnorePointer(
-      child: Positioned.fill(
+    return Positioned.fill(
+      child: IgnorePointer(
         child: Column(
           children: [
             Expanded(
@@ -580,9 +1234,13 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     }
 
     final routeStatus = _pathIsBlocked
-        ? "Hazard on route"
-        : "Route looks clear";
-    final statusColor = _pathIsBlocked ? _dangerColor : _accentColor;
+        ? "IMPASSABLE / ROAD CLOSED (Half-Tire Deep)"
+        : (_isFloodWarningAhead
+              ? "CAUTION: WATER ON ROAD (Gutter Deep)"
+              : "NO FLOOD / CLEAR");
+    final statusColor = _pathIsBlocked
+        ? _dangerColor
+        : (_isFloodWarningAhead ? Colors.orangeAccent : _accentColor);
 
     return Positioned(
       top: MediaQuery.of(context).padding.top + 80,
@@ -713,6 +1371,52 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         );
       },
     );
+  }
+
+  List<Polyline> _buildHazardRadiusRings(List<Map<String, dynamic>> reports) {
+    const Distance distance = Distance();
+    final List<Polyline> rings = [];
+
+    for (final report in reports) {
+      final decision = (report['admin_decision'] ?? '').toString();
+      if (decision != 'Impassable' && decision != 'Risky') continue;
+
+      final lat = (report['latitude'] as num?)?.toDouble();
+      final lng = (report['longitude'] as num?)?.toDouble();
+      if (lat == null || lng == null) continue;
+
+      final center = LatLng(lat, lng);
+      final radiusMeters = decision == 'Impassable' ? 150.0 : 80.0;
+      final ringColor = decision == 'Impassable'
+          ? _dangerColor.withAlpha(220)
+          : Colors.orangeAccent.withAlpha(220);
+
+      // Draw a broken circle using many short arc segments.
+      const int segments = 36; // 10 degrees each around the circle
+      for (int i = 0; i < segments; i++) {
+        if (i.isOdd) continue; // every other segment is skipped (gap)
+
+        final startBearing = i * (360.0 / segments);
+        final midBearing = startBearing + 4.0;
+        final endBearing = startBearing + 8.0;
+
+        final p1 = distance.offset(center, radiusMeters, startBearing);
+        final p2 = distance.offset(center, radiusMeters, midBearing);
+        final p3 = distance.offset(center, radiusMeters, endBearing);
+
+        rings.add(
+          Polyline(
+            points: [p1, p2, p3],
+            color: ringColor,
+            strokeWidth: 3.0,
+            borderColor: Colors.black.withAlpha(80),
+            borderStrokeWidth: 0.8,
+          ),
+        );
+      }
+    }
+
+    return rings;
   }
 
   Map<String, dynamic>? _pickWaterLevelReport(List<Map<String, dynamic>> reports) {
@@ -882,6 +1586,14 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   Future<void> _fastTrackLocation() async {
+    if (_useFixedCurrentLocation) {
+      if (mounted) {
+        setState(() => _currentPCPos = _cituLocation);
+      }
+      _mapController.move(_cituLocation, 15.0);
+      return;
+    }
+
     LocationPermission permission = await Geolocator.checkPermission();
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
@@ -930,6 +1642,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   Future<void> _initLocationTracking() async {
+    if (_useFixedCurrentLocation) return;
+
     Geolocator.getPositionStream(
       locationSettings: const LocationSettings(
         accuracy: LocationAccuracy.high,
@@ -1058,6 +1772,51 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _buildZoomControls() {
+    return Positioned(
+      bottom: _pathIsBlocked ? 170 : 125,
+      right: 18,
+      child: Container(
+        decoration: BoxDecoration(
+          color: const Color(0xFF1A2432).withAlpha(220),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: Colors.white24),
+          boxShadow: const [
+            BoxShadow(
+              color: Colors.black38,
+              blurRadius: 12,
+              offset: Offset(0, 4),
+            ),
+          ],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton(
+              tooltip: 'Zoom in',
+              icon: const Icon(Icons.add, color: Colors.white),
+              onPressed: () {
+                final currentZoom = _mapController.camera.zoom;
+                final targetZoom = (currentZoom + 1.0).clamp(3.0, 19.0);
+                _mapController.move(_mapController.camera.center, targetZoom);
+              },
+            ),
+            Container(height: 1, width: 38, color: Colors.white24),
+            IconButton(
+              tooltip: 'Zoom out',
+              icon: const Icon(Icons.remove, color: Colors.white),
+              onPressed: () {
+                final currentZoom = _mapController.camera.zoom;
+                final targetZoom = (currentZoom - 1.0).clamp(3.0, 19.0);
+                _mapController.move(_mapController.camera.center, targetZoom);
+              },
+            ),
+          ],
+        ),
       ),
     );
   }

@@ -13,7 +13,7 @@ Future<void> main() async {
 
   // 3. Initialize Supabase
   await Supabase.initialize(
-    url: 'https://ttsrktldvvqrgkfhsbbl.supabase.co',
+    url: 'https://ttsrktldvvqrgkfhsbbl.supabase.co/',
     anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR0c3JrdGxkdnZxcmdrZmhzYmJsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI1NDYxODcsImV4cCI6MjA4ODEyMjE4N30.DkQAOtyA4gezkPFCWPtyoS2UKw2NYvZcAlsAWbql3QY',
   );
 
@@ -51,6 +51,7 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
     with TickerProviderStateMixin {
   int _tapCount = 0;
   Timer? _tapTimer;
+  late final ScrollController _onboardingScrollController;
   late final AnimationController _bgController;
   late final AnimationController _entryController;
   late final Animation<double> _titleFade;
@@ -76,6 +77,7 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
   @override
   void initState() {
     super.initState();
+    _onboardingScrollController = ScrollController();
     _bgController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 3800),
@@ -96,6 +98,7 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
   @override
   void dispose() {
     _tapTimer?.cancel();
+    _onboardingScrollController.dispose();
     _bgController.dispose();
     _entryController.dispose();
     super.dispose();
@@ -145,38 +148,43 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
               opacity: _titleFade,
               child: SlideTransition(
                 position: _titleSlide,
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 24.0),
-                  child: Column(
-                    children: [
-                      const SizedBox(height: 34),
-                      _buildLogo(),
-                      const SizedBox(height: 20),
-                      const Text(
-                        'Welcome to Floote',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(
-                          fontSize: 34,
-                          fontWeight: FontWeight.w800,
-                          color: Colors.white,
+                child: Scrollbar(
+                  controller: _onboardingScrollController,
+                  thumbVisibility: true,
+                  child: SingleChildScrollView(
+                    controller: _onboardingScrollController,
+                    padding: const EdgeInsets.symmetric(horizontal: 24.0),
+                    child: Column(
+                      children: [
+                        const SizedBox(height: 34),
+                        _buildLogo(),
+                        const SizedBox(height: 20),
+                        const Text(
+                          'Welcome to Floote',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(
+                            fontSize: 34,
+                            fontWeight: FontWeight.w800,
+                            color: Colors.white,
+                          ),
                         ),
-                      ),
-                      const SizedBox(height: 10),
-                      const Text(
-                        'Real-time flood detection for a safer commute',
-                        textAlign: TextAlign.center,
-                        style: TextStyle(fontSize: 16, color: Colors.white70),
-                      ),
-                      const SizedBox(height: 28),
-                      _buildFeatureCard(Icons.location_on_outlined, 'Live Flood Data', 'Updates from sensors in Talisay, Tabunok, and Minglanilla'),
-                      const SizedBox(height: 14),
-                      _buildFeatureCard(Icons.shield_outlined, 'Safe Routes', 'Navigate around flooded areas automatically'),
-                      const SizedBox(height: 14),
-                      _buildFeatureCard(Icons.water_drop_outlined, 'Water Level Alerts', 'Track rising levels and get warned before roads become impassable'),
-                      const Spacer(),
-                      _buildGetStartedButton(context),
-                      const SizedBox(height: 24),
-                    ],
+                        const SizedBox(height: 10),
+                        const Text(
+                          'Real-time flood detection for a safer commute',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(fontSize: 16, color: Colors.white70),
+                        ),
+                        const SizedBox(height: 28),
+                        _buildFeatureCard(Icons.location_on_outlined, 'Live Flood Data', 'Updates from sensors in Talisay, Tabunok, and Minglanilla'),
+                        const SizedBox(height: 14),
+                        _buildFeatureCard(Icons.shield_outlined, 'Safe Routes', 'Navigate around flooded areas automatically'),
+                        const SizedBox(height: 14),
+                        _buildFeatureCard(Icons.water_drop_outlined, 'Water Level Alerts', 'Track rising levels and get warned before roads become impassable'),
+                        const SizedBox(height: 24),
+                        _buildGetStartedButton(context),
+                        const SizedBox(height: 24),
+                      ],
+                    ),
                   ),
                 ),
               ),
