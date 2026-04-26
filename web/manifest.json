@@ -1,11 +1,11 @@
 {
-    "name": "Floote",
-    "short_name": "Floote",
+    "name": "first",
+    "short_name": "first",
     "start_url": ".",
     "display": "standalone",
     "background_color": "#0175C2",
     "theme_color": "#0175C2",
-    "description": "Floote — real-time flood detection and safer routes.",
+    "description": "A new Flutter project.",
     "orientation": "portrait-primary",
     "prefer_related_applications": false,
     "icons": [

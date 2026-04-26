@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-import 'package:first/utils/fcm_service.dart';
 import 'pages/login_page.dart';
 import 'pages/rescuer_login_page.dart';
 
@@ -17,15 +16,6 @@ Future<void> main() async {
     url: 'https://ttsrktldvvqrgkfhsbbl.supabase.co/',
     anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR0c3JrdGxkdnZxcmdrZmhzYmJsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI1NDYxODcsImV4cCI6MjA4ODEyMjE4N30.DkQAOtyA4gezkPFCWPtyoS2UKw2NYvZcAlsAWbql3QY',
   );
-
-  await FcmService.instance.initAfterSupabase();
-  Supabase.instance.client.auth.onAuthStateChange.listen((data) {
-    if (data.session != null) {
-      unawaited(FcmService.instance.onAuthSessionReady());
-    } else {
-      unawaited(FcmService.instance.onSignedOut());
-    }
-  });
 
   runApp(const FlooteApp());
 }
@@ -71,20 +61,17 @@ class _FlooteOnboardingState extends State<FlooteOnboarding>
     _tapTimer?.cancel();
     setState(() => _tapCount++);
 
-    if (_tapCount == 2) {
+    if (_tapCount == 5) {
       _tapCount = 0;
       Navigator.push(
         context,
         MaterialPageRoute(builder: (context) => const RescuerLoginPage()),
       );
-      return;
-    }
-
-    _tapTimer = Timer(const Duration(seconds: 2), () {
-      if (mounted) {
+    } else {
+      _tapTimer = Timer(const Duration(seconds: 2), () {
         setState(() => _tapCount = 0);
-      }
-    });
+      });
+    }
   }
 
   @override

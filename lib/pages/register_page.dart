@@ -1,8 +1,5 @@
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-import '../utils/auth_login.dart';
-import '../utils/philippine_phone.dart';
 import 'login_page.dart';
 import 'location_permission_page.dart';
 
@@ -15,7 +12,6 @@ class RegisterPage extends StatefulWidget {
 
 class _RegisterPageState extends State<RegisterPage>
     with TickerProviderStateMixin {
-  final _usernameController = TextEditingController();
   final _emailController = TextEditingController();
   final _phoneController = TextEditingController();
   final _passwordController = TextEditingController();
@@ -38,7 +34,6 @@ class _RegisterPageState extends State<RegisterPage>
 
   @override
   void dispose() {
-    _usernameController.dispose();
     _emailController.dispose();
     _phoneController.dispose();
     _passwordController.dispose();
@@ -49,25 +44,10 @@ class _RegisterPageState extends State<RegisterPage>
 
   Future<void> _handleRegistration() async {
     // Basic Validation
-    if (_usernameController.text.isEmpty ||
-        _emailController.text.isEmpty ||
-        _passwordController.text.isEmpty) {
+    if (_emailController.text.isEmpty || _passwordController.text.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Please fill in all required fields')),
       );
-      return;
-    }
-
-    final phoneNormalized = normalizePhilippineMobile(_phoneController.text);
-    if (phoneNormalized == null) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(kRegistrationFailed),
-            backgroundColor: Colors.redAccent,
-          ),
-        );
-      }
       return;
     }
 
@@ -75,121 +55,48 @@ class _RegisterPageState extends State<RegisterPage>
 
     try {
       final supabase = Supabase.instance.client;
-      final username = normalizeAuthIdentifier(_usernameController.text);
-      final email = normalizeAuthIdentifier(_emailController.text);
 
-      if (!email.contains('@')) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-              content: Text(kRegistrationFailed),
-              backgroundColor: Colors.redAccent,
-            ),
-          );
-        }
-        return;
-      }
-
-      // No pre-check of username in profiles: it can leak whether a username
-      // exists and often fails under RLS. Uniqueness is enforced in the database.
-
+      // 1. Create the Auth account in Supabase
       final AuthResponse res = await supabase.auth.signUp(
-        email: email,
+        email: _emailController.text.trim(),
         password: _passwordController.text.trim(),
-        data: {
-          'username': username,
-          'phone_number': phoneNormalized,
-        },
       );
 
-      if (res.user == null) {
-        if (kDebugMode) {
-          debugPrint('Register: signUp returned no user.');
-        }
+      // 2. Insert extra data into your 'profiles' table
+      if (res.user != null) {
+        await supabase.from('profiles').insert({
+          'id': res.user!.id,
+          'email': _emailController.text.trim(),
+          'phone_number': _phoneController.text.trim(),
+          'role': 'user', // Default role
+        });
+
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text(kRegistrationFailed),
-              backgroundColor: Colors.redAccent,
+              content: Text('Registration Successful!'),
+              backgroundColor: Colors.green,
+            ),
+          );
+          Navigator.pushReplacement(
+            context,
+            MaterialPageRoute(
+              builder: (context) => const LocationPermissionPage(),
             ),
           );
         }
-        return;
       }
-
-      final profileRow = <String, dynamic>{
-        'id': res.user!.id,
-        'username': username,
-        'email': email,
-        'role': 'user',
-        'phone_number': phoneNormalized,
-      };
-
-      try {
-        await supabase.from('profiles').upsert(
-          profileRow,
-          onConflict: 'id',
+    } on AuthException catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(e.message), backgroundColor: Colors.redAccent),
         );
-      } catch (e, st) {
-        if (kDebugMode) {
-          debugPrint('profiles upsert failed: $e\n$st');
-        }
-        // Auth user may already exist; profile write often fails under RLS until
-        // email is confirmed or a DB trigger fills profiles. Clear partial session.
-        if (res.session != null) {
-          await supabase.auth.signOut();
-        }
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).clearSnackBars();
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(
-            builder: (context) => const LoginPage(
-              initialBannerText: kRegistrationCreatedUseSignIn,
-              initialBannerSuccess: true,
-            ),
-          ),
-        );
-        return;
       }
-
-      if (!mounted) return;
-
-      final hasSession = res.session != null;
-      ScaffoldMessenger.of(context).clearSnackBars();
-      Navigator.pushReplacement(
-        context,
-        MaterialPageRoute(
-          builder: (context) => hasSession
-              ? const LocationPermissionPage(
-                  initialBannerText: kRegistrationSuccess,
-                )
-              : const LoginPage(
-                  initialBannerText: kRegistrationCreatedUseSignIn,
-                  initialBannerSuccess: true,
-                ),
-        ),
-      );
-    } on AuthException catch (_) {
-      if (kDebugMode) {
-        debugPrint('Register AuthException (details omitted; use Supabase logs).');
-      }
+    } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text(kRegistrationFailed),
-            backgroundColor: Colors.redAccent,
-          ),
-        );
-      }
-    } catch (e, st) {
-      if (kDebugMode) {
-        debugPrint('Register error: $e\n$st');
-      }
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(kRegistrationFailed),
+            content: Text('An unexpected error occurred'),
             backgroundColor: Colors.redAccent,
           ),
         );
@@ -333,22 +240,15 @@ class _RegisterPageState extends State<RegisterPage>
                             ),
                             const SizedBox(height: 24),
                             _buildInputField(
-                              label: 'Username',
-                              hint: 'your.username',
-                              controller: _usernameController,
-                            ),
-                            const SizedBox(height: 16),
-                            _buildInputField(
                               label: 'Email',
                               hint: 'your.email@example.com',
                               controller: _emailController,
                             ),
                             const SizedBox(height: 16),
                             _buildInputField(
-                              label: 'Phone Number *',
-                              hint: '09XX XXX XXXX or +639XX XXX XXXX',
+                              label: 'Phone Number',
+                              hint: '+63 XXX XXX XXXX',
                               controller: _phoneController,
-                              helperText: 'Philippine mobile number (required)',
                             ),
                             const SizedBox(height: 16),
                             _buildInputField(
@@ -432,7 +332,6 @@ class _RegisterPageState extends State<RegisterPage>
     required String hint,
     required TextEditingController controller,
     bool isPassword = false,
-    String? helperText,
   }) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -449,11 +348,8 @@ class _RegisterPageState extends State<RegisterPage>
         TextField(
           controller: controller,
           obscureText: isPassword,
-          keyboardType:
-              isPassword ? TextInputType.visiblePassword : TextInputType.phone,
           decoration: InputDecoration(
             hintText: hint,
-            helperText: helperText,
             filled: true,
             fillColor: const Color(0xFFF4F8FF),
             border: OutlineInputBorder(
