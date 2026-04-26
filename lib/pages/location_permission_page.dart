@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
-import 'home_page.dart';
+import 'user_home_page.dart';
 
 class LocationPermissionPage extends StatefulWidget {
-  const LocationPermissionPage({super.key});
+  const LocationPermissionPage({super.key, this.initialBannerText});
+
+  final String? initialBannerText;
 
   @override
   State<LocationPermissionPage> createState() => _LocationPermissionPageState();
@@ -24,6 +26,20 @@ class _LocationPermissionPageState extends State<LocationPermissionPage>
       vsync: this,
       duration: const Duration(milliseconds: 800),
     )..forward();
+
+    final banner = widget.initialBannerText;
+    if (banner != null && banner.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).clearSnackBars();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(banner),
+            backgroundColor: Colors.green,
+          ),
+        );
+      });
+    }
   }
 
   @override
@@ -147,7 +163,7 @@ class _LocationPermissionPageState extends State<LocationPermissionPage>
                           Navigator.pushReplacement(
                             context,
                             MaterialPageRoute(
-                              builder: (context) => const HomePage(),
+                              builder: (context) => const UserHomePage(),
                             ),
                           );
                         },

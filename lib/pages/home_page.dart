@@ -1,16 +1,35 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
+import 'package:google_navigation_flutter/google_navigation_flutter.dart' as gnav;
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_typeahead/flutter_typeahead.dart';
+import 'package:first/utils/sensor_reading_format.dart';
+import 'package:first/services/flood_route_service.dart';
+
 import 'emergency_page.dart';
+import 'user_navigation_page.dart';
+import 'profile_page.dart';
+import 'rescuer_historical_logs_page.dart';
+import 'rescuer_navigation_page.dart';
+import 'rescuer_rescue_center_page.dart';
+import 'rescuer_sensor_network_page.dart';
+import 'widgets/home_tab_widgets.dart';
+
+part 'home_page_map_layers.dart';
+part 'home_page_route_service.dart';
+part 'home_page_hazard_widgets.dart';
 
 class HomePage extends StatefulWidget {
-  const HomePage({super.key});
+  final bool isRescuerAccount;
+
+  const HomePage({super.key, this.isRescuerAccount = false});
 
   @override
   State<HomePage> createState() => _HomePageState();
@@ -19,12 +38,30 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   final MapController _mapController = MapController();
   final TextEditingController _searchController = TextEditingController();
+  gnav.GoogleMapViewController? _androidMapController;
+  gnav.ImageDescriptor? _androidBluePinDescriptor;
 
   static const Color _accentColor = Color(0xFF00E4FF);
   static const Color _dangerColor = Color(0xFFFF4C4C);
   static const Color _panelColor = Color(0xFF111A24);
-  static const LatLng _cituLocation = LatLng(10.297438, 123.876313);
-  static const bool _useFixedCurrentLocation = true;
+  /// Light basemap used as the `flutter_map` fallback (non-Android / Nav SDK init failure).
+  /// Kept light to match the Navigation SDK's `MapColorScheme.light` and avoid the
+  /// dark CartoDB `dark_all` tiles that previously bled through on the Map tab.
+  static const String _darkTileUrl =
+      'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png';
+
+  /// Fallback camera / search bias before first GPS fix (Google Map needs a valid point).
+  /// Approximate center of Metro Cebu (not a single campus)—tweak zoom in code for island-wide views.
+  static const LatLng _cebuLocation = LatLng(10.2926, 123.9022);
+
+  /// Wider zoom when showing [_cebuLocation] before any GPS fix (Metro Cebu context).
+  static const double _cebuFallbackZoom = 11.0;
+
+  /// Live GPS for position and map; set [true] only to pin the map to [_cebuLocation] (e.g. emulator).
+  static const bool _useFixedCurrentLocation = false;
+
+  LatLng _mapCenter = _cebuLocation;
+  double _mapZoom = 15.0;
 
   late final AnimationController _pulseController;
   late final AnimationController _sosController;
@@ -32,9 +69,28 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   bool _isRerouting = false;
   bool _pathIsBlocked = false;
   bool _isFloodWarningAhead = false;
-  List<Map<String, dynamic>> _cachedVerifiedReports = const [];
+  bool _isActiveDuty = false;
+  /// Bumps on each duty persist so late async loads cannot overwrite the switch after user action.
+  int _dutySyncGeneration = 0;
+  bool _isMapReady = false;
+  bool _androidNavMapReady = false;
+  String? _androidNavMapError;
+  Timer? _rescuerPresenceTimer;
 
-  LatLng? _currentPCPos = _cituLocation;
+  /// First bottom-nav item: Dashboard (rescuer) or Map (regular user).
+  int _bottomNavIndex = 0;
+
+  /// After accepting an SOS from Rescue Center: show bottom "Start" on map (UI only for now).
+  bool _showRescuerNavStartBar = false;
+  bool _showUserNavStartBar = false;
+  String? _activeRescueDispatchId;
+  String? _activeRescueTicketNumber;
+  LatLng? _activeRescueDestination;
+  List<Map<String, dynamic>> _cachedVerifiedReports = const [];
+  String _androidOverlayDigest = '';
+  final Map<String, Map<String, dynamic>> _androidHazardReportByMarkerId = {};
+
+  LatLng? _currentPCPos;
   double _currentHeading = 0.0;
 
   List<LatLng> _routePoints = [];
@@ -44,8 +100,28 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     'MAPBOX_TOKEN',
     defaultValue: '',
   );
-  static const String _mapboxStyleId = 'mapbox/streets-v12';
-  bool get _useMapbox => _mapboxToken.startsWith('pk.') && _mapboxToken.isNotEmpty;
+  static const String _googlePlacesApiKey = String.fromEnvironment(
+    'GOOGLE_PLACES_API_KEY',
+    defaultValue: '',
+  );
+  static const bool _allowLegacySearchFallback = bool.fromEnvironment(
+    'ALLOW_LEGACY_GEOCODER_FALLBACK',
+    defaultValue: false,
+  );
+  /// Default to the Navigation SDK map layer on Android so the Map tab matches
+  /// the other map screens. Override at build time with
+  /// `--dart-define=USE_ANDROID_NAV_MAP_LAYER=false` to fall back to `flutter_map`.
+  static const bool _useAndroidNavigationMapLayer = bool.fromEnvironment(
+    'USE_ANDROID_NAV_MAP_LAYER',
+    defaultValue: true,
+  );
+  bool get _useMapbox =>
+      _mapboxToken.startsWith('pk.') && _mapboxToken.isNotEmpty;
+  bool get _useGooglePlaces => _googlePlacesApiKey.isNotEmpty;
+  bool get _useNavigationMapLayer =>
+      _useAndroidNavigationMapLayer &&
+      !kIsWeb &&
+      defaultTargetPlatform == TargetPlatform.android;
 
   @override
   void initState() {
@@ -58,11 +134,218 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       vsync: this,
       duration: const Duration(milliseconds: 1200),
     )..repeat(reverse: true);
+    unawaited(_prepareAndroidNavigationMapLayer());
     _fastTrackLocation();
+    if (widget.isRescuerAccount) {
+      unawaited(_loadRescuerDutyFromProfile().then((_) {
+        if (_isActiveDuty) {
+          unawaited(_pushRescuerLocationToProfile());
+        }
+        _startRescuerPresenceTimer();
+      }));
+    }
+  }
+
+  Future<void> _prepareAndroidNavigationMapLayer() async {
+    if (!_useNavigationMapLayer) return;
+    try {
+      final accepted = await gnav.GoogleMapsNavigator.areTermsAccepted();
+      if (!accepted) {
+        await gnav.GoogleMapsNavigator.showTermsAndConditionsDialog(
+          'Floote Navigation',
+          'Floote',
+        );
+      }
+      final initialized = await gnav.GoogleMapsNavigator.isInitialized();
+      if (!initialized) {
+        await gnav.GoogleMapsNavigator.initializeNavigationSession(
+          taskRemovedBehavior: gnav.TaskRemovedBehavior.continueService,
+        );
+      }
+      if (!mounted) return;
+      setState(() {
+        _androidNavMapReady = true;
+        _androidNavMapError = null;
+        _isMapReady = true;
+      });
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _androidNavMapReady = false;
+        _androidNavMapError = 'Navigation map failed to load: $e';
+      });
+    }
+  }
+
+  Future<void> _loadRescuerDutyFromProfile() async {
+    final uid = Supabase.instance.client.auth.currentUser?.id;
+    if (uid == null) return;
+    final generationAtStart = _dutySyncGeneration;
+    try {
+      final row = await Supabase.instance.client
+          .from('profiles')
+          .select('is_on_duty')
+          .eq('id', uid)
+          .maybeSingle();
+      if (!mounted || generationAtStart != _dutySyncGeneration) return;
+      final parsed = _dutyBoolFromRaw(row?['is_on_duty']);
+      if (parsed != null) {
+        setState(() => _isActiveDuty = parsed);
+      }
+    } catch (e) {
+      debugPrint('load rescuer duty: $e');
+    }
+  }
+
+  void _startRescuerPresenceTimer() {
+    _rescuerPresenceTimer?.cancel();
+    _rescuerPresenceTimer =
+        Timer.periodic(const Duration(seconds: 60), (_) {
+      if (!mounted || !widget.isRescuerAccount || !_isActiveDuty) return;
+      unawaited(_pushRescuerLocationToProfile());
+    });
+  }
+
+  static const String _dutySaveFailedUserMessage =
+      'Could not save duty. Please try again.';
+  static const String _dutySessionUserMessage =
+      'Please sign in again, then try once more.';
+
+  void _showDutySnackBar(String message, {bool isError = true}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: isError ? _dangerColor : null,
+      ),
+    );
+  }
+
+  /// [profiles.is_on_duty] may arrive as bool, string, or int depending on client/Postgres.
+  bool? _dutyBoolFromRaw(dynamic raw) {
+    if (raw == null) return null;
+    if (raw is bool) return raw;
+    if (raw is num) return raw != 0;
+    if (raw is String) {
+      final t = raw.toLowerCase().trim();
+      if (t == 'true' || t == 't' || t == '1' || t == 'yes') return true;
+      if (t == 'false' || t == 'f' || t == '0' || t == 'no') return false;
+    }
+    return null;
+  }
+
+  /// PostgREST RPC scalars are usually a bare JSON value; unwrap single-element lists defensively.
+  dynamic _unwrapRpcScalar(dynamic raw) {
+    if (raw is List && raw.length == 1) return raw[0];
+    return raw;
+  }
+
+  bool _dutyBoolMatches(dynamic raw, bool expected) {
+    final v = _dutyBoolFromRaw(_unwrapRpcScalar(raw));
+    if (v == null) return false;
+    return v == expected;
+  }
+
+  Future<void> _persistDutyToggle(bool value) async {
+    _dutySyncGeneration++;
+    final generationAtWrite = _dutySyncGeneration;
+    final previous = _isActiveDuty;
+    setState(() => _isActiveDuty = value);
+
+    final uid = Supabase.instance.client.auth.currentUser?.id;
+    if (uid == null) {
+      if (mounted && generationAtWrite == _dutySyncGeneration) {
+        setState(() => _isActiveDuty = previous);
+        _showDutySnackBar(_dutySessionUserMessage);
+      }
+      return;
+    }
+
+    try {
+      try {
+        await Supabase.instance.client.auth.refreshSession();
+      } catch (e) {
+        debugPrint('duty persist: refreshSession skipped: $e');
+      }
+
+      // Prefer SECURITY DEFINER RPC so duty persists even when direct UPDATE is blocked by RLS.
+      // Deploy: supabase/sql/set_rescuer_on_duty_rpc.sql
+      final rpcResult = await Supabase.instance.client.rpc(
+        'set_rescuer_on_duty',
+        params: {'p_on_duty': value},
+      );
+
+      if (!mounted || generationAtWrite != _dutySyncGeneration) return;
+
+      final persisted = _dutyBoolMatches(rpcResult, value);
+      if (!persisted) {
+        setState(() => _isActiveDuty = previous);
+        debugPrint(
+          'duty persist: RPC unexpected value (expected $value got $rpcResult)',
+        );
+        _showDutySnackBar(_dutySaveFailedUserMessage);
+        return;
+      }
+
+      if (value) {
+        _startRescuerPresenceTimer();
+        await _pushRescuerLocationToProfile();
+      } else {
+        _rescuerPresenceTimer?.cancel();
+      }
+    } catch (e, st) {
+      debugPrint('duty persist: $e\n$st');
+      if (!mounted || generationAtWrite != _dutySyncGeneration) return;
+      setState(() => _isActiveDuty = previous);
+      _showDutySnackBar(_dutySaveFailedUserMessage);
+    }
+  }
+
+  Future<void> _pushRescuerLocationToProfile() async {
+    final uid = Supabase.instance.client.auth.currentUser?.id;
+    if (uid == null || !widget.isRescuerAccount || !_isActiveDuty) return;
+    try {
+      Position? pos;
+      try {
+        pos = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+          ),
+        );
+      } catch (e) {
+        debugPrint('rescuer location push: getCurrentPosition: $e');
+      }
+      pos ??= await Geolocator.getLastKnownPosition();
+      // DB location is always from the device (current or last-known GPS), never a map placeholder.
+      if (pos == null) {
+        debugPrint('rescuer location push: no position (GPS off or denied?)');
+        return;
+      }
+      if (!mounted) return;
+      try {
+        await Supabase.instance.client.auth.refreshSession();
+      } catch (e) {
+        debugPrint('rescuer location push: refreshSession skipped: $e');
+      }
+      await Supabase.instance.client.rpc(
+        'set_rescuer_last_location',
+        params: {
+          'p_latitude': pos.latitude,
+          'p_longitude': pos.longitude,
+        },
+      );
+    } catch (e, st) {
+      debugPrint('rescuer location push: $e\n$st');
+    }
   }
 
   @override
   void dispose() {
+    _rescuerPresenceTimer?.cancel();
+    final descriptor = _androidBluePinDescriptor;
+    if (descriptor != null) {
+      unawaited(gnav.unregisterImage(descriptor));
+    }
     _pulseController.dispose();
     _sosController.dispose();
     _searchController.dispose();
@@ -80,8 +363,11 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   ) {
     final normalized = <Map<String, dynamic>>[];
     for (final r in allReports) {
-      final decision = (r['admin_decision'] ?? '').toString().trim();
-      if (decision != 'Impassable' && decision != 'Risky') continue;
+      final decision = (r['admin_decision'] ?? '')
+          .toString()
+          .trim()
+          .toLowerCase();
+      if (decision != 'impassable' && decision != 'risky') continue;
       final lat = _toDouble(r['latitude']);
       final lng = _toDouble(r['longitude']);
       if (lat == null || lng == null) continue;
@@ -101,19 +387,22 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
     for (var point in _routePoints) {
       for (var report in reports) {
-        final decision = (report['admin_decision'] ?? '').toString();
+        final decision = (report['admin_decision'] ?? '')
+            .toString()
+            .trim()
+            .toLowerCase();
         final d = distance.as(
           LengthUnit.Meter,
           point,
           LatLng(report['latitude'], report['longitude']),
         );
 
-        if (decision == 'Impassable' && d < 150) {
+        if (decision == 'impassable' && d < 150) {
           hazardFound = true;
           break;
         }
 
-        if (decision == 'Risky' && d < 80) {
+        if (decision == 'risky' && d < 80) {
           warningFound = true;
         }
       }
@@ -131,28 +420,21 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   // --- 2. IMMEDIATE STANDARD ROUTE (OSRM) ---
   Future<void> _getInitialRoute(LatLng destination) async {
     if (_currentPCPos == null) return;
-    final url =
-        'https://router.project-osrm.org/route/v1/driving/${_currentPCPos!.longitude},${_currentPCPos!.latitude};${destination.longitude},${destination.latitude}?overview=full&geometries=geojson';
-
     try {
-      final response = await http.get(Uri.parse(url));
-      if (response.statusCode == 200) {
-        final data = json.decode(response.body);
-        final List coords = data['routes'][0]['geometry']['coordinates'];
+      final initialRoute = await _HomePageRouteService.shapeDirectRoadRoute(
+        this,
+        _currentPCPos!,
+        destination,
+        const [],
+      );
+      if (initialRoute.length >= 2) {
         setState(() {
-          _routePoints = coords
-              .map((c) => LatLng(c[1].toDouble(), c[0].toDouble()))
-              .toList();
+          _routePoints = initialRoute;
           _pathIsBlocked = false;
         });
 
         if (_routePoints.isNotEmpty) {
-          _mapController.fitCamera(
-            CameraFit.bounds(
-              bounds: LatLngBounds.fromPoints(_routePoints),
-              padding: const EdgeInsets.all(70.0),
-            ),
-          );
+          _fitMapToPoints(_routePoints);
         }
       }
     } catch (e) {
@@ -162,660 +444,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
   // --- 3. FASTAPI FLOOD-AWARE REROUTE ---
   Future<void> _getSafeAStarRoute(
-    List<Map<String, dynamic>> _verifiedReports,
+    List<Map<String, dynamic>> verifiedReports,
   ) async {
-    if (_currentPCPos == null || _destinationPos == null) return;
-
-    setState(() => _isRerouting = true);
-
-    // Use emulator loopback by default. Override using:
-    // flutter run --dart-define=ROUTING_API_URL=http://<your-ip>:8000/route
-    const String apiUrlOverride = String.fromEnvironment('ROUTING_API_URL');
-    final String apiUrl = apiUrlOverride.isNotEmpty
-        ? apiUrlOverride
-        : (kIsWeb
-              ? 'http://127.0.0.1:8000/route'
-              : 'http://10.0.2.2:8000/route');
-
-    // Build a lightweight dynamic graph from current route geometry.
-    // This lets FastAPI run safety checks using live Supabase flood reports.
-    final List<LatLng> seedPoints = [];
-    seedPoints.add(_currentPCPos!);
-
-    if (_routePoints.length > 2) {
-      final step = (_routePoints.length / 24).ceil().clamp(1, 10);
-      for (int i = step; i < _routePoints.length - 1; i += step) {
-        seedPoints.add(_routePoints[i]);
-      }
-    }
-
-    seedPoints.add(_destinationPos!);
-
-    final hazardPoints = _verifiedReports
-        .where((r) => (r['admin_decision'] ?? '').toString() == 'Impassable')
-        .where((r) => r['latitude'] is num && r['longitude'] is num)
-        .map(
-          (r) => LatLng(
-            (r['latitude'] as num).toDouble(),
-            (r['longitude'] as num).toDouble(),
-          ),
-        )
-        .toList();
-
-    final attemptConfigs = <Map<String, dynamic>>[
-      {'maxLane': 2, 'laneStepMeters': 180.0},
-      {'maxLane': 3, 'laneStepMeters': 230.0},
-      {'maxLane': 4, 'laneStepMeters': 280.0},
-    ];
-
-    String lastError = "No safe route found";
-    bool connected = false;
-
-    for (int attempt = 0; attempt < attemptConfigs.length; attempt++) {
-      final cfg = attemptConfigs[attempt];
-      final payload = _buildDetourPayload(
-        seedPoints,
-        maxLane: cfg['maxLane'] as int,
-        laneStepMeters: cfg['laneStepMeters'] as double,
-      );
-
-      try {
-        final response = await http.post(
-          Uri.parse(apiUrl),
-          headers: {"Content-Type": "application/json"},
-          body: json.encode(payload),
-        );
-        connected = true;
-
-        if (response.statusCode != 200) {
-          lastError = "Routing API error: ${response.statusCode}";
-          continue;
-        }
-
-        final data = json.decode(response.body);
-        final status = (data['status'] ?? '').toString();
-        if (status != 'safe' && status != 'rerouted') {
-          lastError = (data['message'] ?? "No safe route found").toString();
-          continue;
-        }
-
-        final List coords = (data['polyline'] ?? []) as List;
-        if (coords.isEmpty) {
-          lastError = "Routing service returned empty polyline.";
-          continue;
-        }
-
-        final backendPolyline = coords
-            .where((c) => c is Map && c['lat'] is num && c['lng'] is num)
-            .map<LatLng>(
-              (c) => LatLng(
-                (c['lat'] as num).toDouble(),
-                (c['lng'] as num).toDouble(),
-              ),
-            )
-            .toList();
-
-        if (backendPolyline.length < 2) {
-          lastError = "Routing service returned invalid polyline.";
-          continue;
-        }
-
-        final shapedPolyline = await _shapePolylineOnRoads(
-          backendPolyline,
-          hazardPoints,
-        );
-
-        if (shapedPolyline.isEmpty) {
-          lastError = "No road-following reroute found.";
-          continue;
-        }
-        if (_routeIntersectsHazards(shapedPolyline, hazardPoints, 150.0)) {
-          lastError = "No safe reroute found outside 150m hazard radius.";
-          continue;
-        }
-
-        final cleaned = _removeDeadEndLoops(shapedPolyline);
-        if (cleaned.length < 2) {
-          lastError = "No road-following reroute found.";
-          continue;
-        }
-
-        if (!mounted) return;
-        setState(() {
-          _routePoints = cleaned;
-          _isRerouting = false;
-          _pathIsBlocked = false;
-          _isFloodWarningAhead = false;
-        });
-        _mapController.fitCamera(
-          CameraFit.bounds(
-            bounds: LatLngBounds.fromPoints(_routePoints),
-            padding: const EdgeInsets.all(70.0),
-          ),
-        );
-        return;
-      } catch (e) {
-        debugPrint("FastAPI route error (attempt ${attempt + 1}): $e");
-        lastError = "Cannot connect to routing backend.";
-        break;
-      }
-    }
-
-    // Final fallback: try a bypass corridor route with offset waypoints.
-    final bypassRoute = await _shapeViaBypassCorridor(
-      _currentPCPos!,
-      _destinationPos!,
-      hazardPoints,
-    );
-    if (bypassRoute.isNotEmpty && mounted) {
-      setState(() {
-        _routePoints = _removeDeadEndLoops(bypassRoute);
-        _isRerouting = false;
-        _pathIsBlocked = false;
-        _isFloodWarningAhead = false;
-      });
-      _mapController.fitCamera(
-        CameraFit.bounds(
-          bounds: LatLngBounds.fromPoints(_routePoints),
-          padding: const EdgeInsets.all(70.0),
-        ),
-      );
-      return;
-    }
-
-    if (!mounted) return;
-    setState(() => _isRerouting = false);
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          connected
-              ? "$lastError Tried wider detour but no valid safe route."
-              : lastError,
-        ),
-        backgroundColor: Colors.red,
-      ),
-    );
-  }
-
-  Map<String, dynamic> _buildDetourPayload(
-    List<LatLng> seedPoints, {
-    required int maxLane,
-    required double laneStepMeters,
-  }) {
-    const Distance dist = Distance();
-    final Map<String, dynamic> payloadNodes = {};
-    final Map<String, List<Map<String, dynamic>>> payloadGraph = {};
-
-    String nodeId(int lane, int idx) => 'L${lane}_$idx';
-    double laneOffsetMeters(int lane) => laneStepMeters * lane.abs();
-
-    LatLng lanePoint(int lane, int idx) {
-      final base = seedPoints[idx];
-      if (lane == 0) return base;
-      final prev = seedPoints[idx == 0 ? idx : idx - 1];
-      final next = seedPoints[idx == seedPoints.length - 1 ? idx : idx + 1];
-      final bearing = dist.bearing(prev, next);
-      final offsetBearing = lane < 0 ? bearing - 90.0 : bearing + 90.0;
-      return dist.offset(base, laneOffsetMeters(lane), offsetBearing);
-    }
-
-    for (int lane = -maxLane; lane <= maxLane; lane++) {
-      for (int i = 0; i < seedPoints.length; i++) {
-        final p = lanePoint(lane, i);
-        final id = nodeId(lane, i);
-        payloadNodes[id] = {'lat': p.latitude, 'lng': p.longitude};
-        payloadGraph[id] = [];
-      }
-    }
-
-    void addEdgeById(String fromId, String toId) {
-      final from = payloadNodes[fromId];
-      final to = payloadNodes[toId];
-      if (from == null || to == null) return;
-      final fromPos = LatLng(
-        (from['lat'] as num).toDouble(),
-        (from['lng'] as num).toDouble(),
-      );
-      final toPos = LatLng(
-        (to['lat'] as num).toDouble(),
-        (to['lng'] as num).toDouble(),
-      );
-      final d = dist.as(LengthUnit.Meter, fromPos, toPos);
-      payloadGraph[fromId]!.add({
-        'to': toId,
-        'distance': d,
-        'flood_depth': 0,
-        'impassable_sign': false,
-      });
-    }
-
-    for (int lane = -maxLane; lane <= maxLane; lane++) {
-      for (int i = 0; i < seedPoints.length - 1; i++) {
-        final a = nodeId(lane, i);
-        final b = nodeId(lane, i + 1);
-        addEdgeById(a, b);
-        addEdgeById(b, a);
-      }
-    }
-
-    for (int i = 0; i < seedPoints.length; i++) {
-      for (int lane = -maxLane; lane < maxLane; lane++) {
-        addEdgeById(nodeId(lane, i), nodeId(lane + 1, i));
-        addEdgeById(nodeId(lane + 1, i), nodeId(lane, i));
-      }
-      if (i < seedPoints.length - 1) {
-        for (int lane = -maxLane; lane <= maxLane; lane++) {
-          if (lane - 1 >= -maxLane) {
-            addEdgeById(nodeId(lane, i), nodeId(lane - 1, i + 1));
-          }
-          if (lane + 1 <= maxLane) {
-            addEdgeById(nodeId(lane, i), nodeId(lane + 1, i + 1));
-          }
-        }
-      }
-    }
-
-    return {
-      "start": nodeId(0, 0),
-      "goal": nodeId(0, seedPoints.length - 1),
-      "nodes": payloadNodes,
-      "graph": payloadGraph,
-    };
-  }
-
-  Future<List<LatLng>> _shapePolylineOnRoads(
-    List<LatLng> controlPoints,
-    List<LatLng> hazardPoints,
-  ) async {
-    if (controlPoints.length < 2) return controlPoints;
-
-    // Keep request size reasonable while preserving route shape.
-    final reduced = <LatLng>[];
-    final step = (controlPoints.length / 30).ceil().clamp(1, 4);
-    for (int i = 0; i < controlPoints.length; i += step) {
-      reduced.add(controlPoints[i]);
-    }
-    if (reduced.last != controlPoints.last) {
-      reduced.add(controlPoints.last);
-    }
-
-    // Snap control points to nearest drivable road first to improve segment routing.
-    final snapped = <LatLng>[];
-    for (final p in reduced) {
-      snapped.add(await _snapToNearestRoad(p));
-    }
-
-    final stitched = <LatLng>[];
-    bool segmentFailed = false;
-
-    try {
-      // Route each segment separately to reduce odd global loops/dead-ends.
-      for (int i = 0; i < snapped.length - 1; i++) {
-        final a = snapped[i];
-        final b = snapped[i + 1];
-        final segUrl = Uri.parse(
-          'https://router.project-osrm.org/route/v1/driving/'
-          '${a.longitude},${a.latitude};${b.longitude},${b.latitude}'
-          '?overview=full&geometries=geojson',
-        );
-        final response = await http.get(segUrl);
-        if (response.statusCode != 200) {
-          debugPrint('OSRM segment shaping failed: ${response.statusCode}');
-          segmentFailed = true;
-          break;
-        }
-        final data = json.decode(response.body);
-        final routes = data['routes'];
-        if (routes is! List || routes.isEmpty) {
-          segmentFailed = true;
-          break;
-        }
-        final coordinates = routes[0]['geometry']['coordinates'];
-        if (coordinates is! List || coordinates.isEmpty) {
-          segmentFailed = true;
-          break;
-        }
-
-        final segPoints = coordinates
-            .map<LatLng>(
-              (c) => LatLng((c[1] as num).toDouble(), (c[0] as num).toDouble()),
-            )
-            .toList();
-
-        if (stitched.isEmpty) {
-          stitched.addAll(segPoints);
-        } else {
-          // avoid duplicate join point between consecutive segments
-          stitched.addAll(segPoints.skip(1));
-        }
-      }
-
-      if (!segmentFailed && stitched.isNotEmpty) {
-        if (_routeIntersectsHazards(stitched, hazardPoints, 150.0)) {
-          // Try a waypoint-based fallback if stitched path clips hazard radius.
-          final viaWaypoint = await _shapeViaSafeWaypoint(
-            snapped,
-            hazardPoints,
-          );
-          if (viaWaypoint.isNotEmpty) {
-            return viaWaypoint;
-          }
-          return _shapeDirectRoadRoute(
-            snapped.first,
-            snapped.last,
-            hazardPoints,
-          );
-        }
-        return stitched;
-      }
-
-      // Segment chain failed: fallback through one "safest" waypoint.
-      final viaWaypoint = await _shapeViaSafeWaypoint(snapped, hazardPoints);
-      if (viaWaypoint.isNotEmpty) {
-        return viaWaypoint;
-      }
-      return _shapeDirectRoadRoute(
-        snapped.first,
-        snapped.last,
-        hazardPoints,
-      );
-    } catch (e) {
-      debugPrint('OSRM shaping error: $e');
-      final viaWaypoint = await _shapeViaSafeWaypoint(snapped, hazardPoints);
-      if (viaWaypoint.isNotEmpty) {
-        return viaWaypoint;
-      }
-      return _shapeDirectRoadRoute(
-        snapped.first,
-        snapped.last,
-        hazardPoints,
-      );
-    }
-  }
-
-  Future<List<LatLng>> _shapeDirectRoadRoute(
-    LatLng start,
-    LatLng end,
-    List<LatLng> hazards,
-  ) async {
-    final url = Uri.parse(
-      'https://router.project-osrm.org/route/v1/driving/'
-      '${start.longitude},${start.latitude};${end.longitude},${end.latitude}'
-      '?overview=full&geometries=geojson',
-    );
-    try {
-      final response = await http.get(url);
-      if (response.statusCode != 200) return [];
-      final data = json.decode(response.body);
-      final routes = data['routes'];
-      if (routes is! List || routes.isEmpty) return [];
-      final coordinates = routes[0]['geometry']['coordinates'];
-      if (coordinates is! List || coordinates.isEmpty) return [];
-      final route = coordinates
-          .map<LatLng>(
-            (c) => LatLng((c[1] as num).toDouble(), (c[0] as num).toDouble()),
-          )
-          .toList();
-      if (_routeIntersectsHazards(route, hazards, 150.0)) return [];
-      return route;
-    } catch (_) {
-      return [];
-    }
-  }
-
-  Future<List<LatLng>> _shapeViaBypassCorridor(
-    LatLng start,
-    LatLng end,
-    List<LatLng> hazards,
-  ) async {
-    const Distance dist = Distance();
-    final baseBearing = dist.bearing(start, end);
-    final leftBearing = baseBearing - 90.0;
-    final rightBearing = baseBearing + 90.0;
-
-    final candidates = <List<LatLng>>[];
-    for (final offset in [250.0, 350.0, 500.0, 650.0]) {
-      for (final side in [leftBearing, rightBearing]) {
-        final p1 = _interpolateLatLng(start, end, 0.35);
-        final p2 = _interpolateLatLng(start, end, 0.70);
-        candidates.add([
-          await _snapToNearestRoad(start),
-          await _snapToNearestRoad(dist.offset(p1, offset, side)),
-          await _snapToNearestRoad(dist.offset(p2, offset, side)),
-          await _snapToNearestRoad(end),
-        ]);
-      }
-    }
-
-    for (final c in candidates) {
-      final url = Uri.parse(
-        'https://router.project-osrm.org/route/v1/driving/'
-        '${c[0].longitude},${c[0].latitude};'
-        '${c[1].longitude},${c[1].latitude};'
-        '${c[2].longitude},${c[2].latitude};'
-        '${c[3].longitude},${c[3].latitude}'
-        '?overview=full&geometries=geojson',
-      );
-      try {
-        final response = await http.get(url);
-        if (response.statusCode != 200) continue;
-        final data = json.decode(response.body);
-        final routes = data['routes'];
-        if (routes is! List || routes.isEmpty) continue;
-        final coordinates = routes[0]['geometry']['coordinates'];
-        if (coordinates is! List || coordinates.isEmpty) continue;
-        final route = coordinates
-            .map<LatLng>(
-              (v) => LatLng((v[1] as num).toDouble(), (v[0] as num).toDouble()),
-            )
-            .toList();
-        if (!_routeIntersectsHazards(route, hazards, 150.0)) {
-          return route;
-        }
-      } catch (_) {
-        continue;
-      }
-    }
-    return [];
-  }
-
-  LatLng _interpolateLatLng(LatLng a, LatLng b, double t) {
-    return LatLng(
-      a.latitude + (b.latitude - a.latitude) * t,
-      a.longitude + (b.longitude - a.longitude) * t,
-    );
-  }
-
-  Future<List<LatLng>> _shapeViaSafeWaypoint(
-    List<LatLng> points,
-    List<LatLng> hazards,
-  ) async {
-    if (points.length < 3) return [];
-    const Distance dist = Distance();
-
-    // Pick the internal point that is farthest from all hazards.
-    LatLng? best;
-    double bestScore = -1.0;
-    final start = points.first;
-    final end = points.last;
-
-    for (int i = 1; i < points.length - 1; i++) {
-      final p = points[i];
-      final fromStart = dist.as(LengthUnit.Meter, start, p);
-      final toEnd = dist.as(LengthUnit.Meter, p, end);
-      if (fromStart < 120 || toEnd < 120) continue;
-
-      double minHz = double.infinity;
-      for (final hz in hazards) {
-        final d = dist.as(LengthUnit.Meter, p, hz);
-        if (d < minHz) minHz = d;
-      }
-      if (hazards.isEmpty) minHz = 999999;
-      if (minHz > bestScore) {
-        bestScore = minHz;
-        best = p;
-      }
-    }
-
-    if (best == null) return [];
-
-    final url = Uri.parse(
-      'https://router.project-osrm.org/route/v1/driving/'
-      '${start.longitude},${start.latitude};'
-      '${best.longitude},${best.latitude};'
-      '${end.longitude},${end.latitude}'
-      '?overview=full&geometries=geojson',
-    );
-    try {
-      final response = await http.get(url);
-      if (response.statusCode != 200) return [];
-      final data = json.decode(response.body);
-      final routes = data['routes'];
-      if (routes is! List || routes.isEmpty) return [];
-      final coordinates = routes[0]['geometry']['coordinates'];
-      if (coordinates is! List || coordinates.isEmpty) return [];
-      final route = coordinates
-          .map<LatLng>(
-            (c) => LatLng((c[1] as num).toDouble(), (c[0] as num).toDouble()),
-          )
-          .toList();
-      if (_routeIntersectsHazards(route, hazards, 150.0)) return [];
-      return route;
-    } catch (_) {
-      return [];
-    }
-  }
-
-  Future<LatLng> _snapToNearestRoad(LatLng point) async {
-    final url = Uri.parse(
-      'https://router.project-osrm.org/nearest/v1/driving/'
-      '${point.longitude},${point.latitude}?number=1',
-    );
-    try {
-      final response = await http.get(url);
-      if (response.statusCode != 200) return point;
-      final data = json.decode(response.body);
-      final waypoints = data['waypoints'];
-      if (waypoints is! List || waypoints.isEmpty) return point;
-      final location = waypoints[0]['location'];
-      if (location is! List || location.length < 2) return point;
-      return LatLng(
-        (location[1] as num).toDouble(),
-        (location[0] as num).toDouble(),
-      );
-    } catch (_) {
-      return point;
-    }
-  }
-
-  bool _routeIntersectsHazards(
-    List<LatLng> route,
-    List<LatLng> hazards,
-    double radiusMeters,
-  ) {
-    if (route.length < 2 || hazards.isEmpty) return false;
-    const Distance dist = Distance();
-
-    for (int i = 0; i < route.length - 1; i++) {
-      final a = route[i];
-      final b = route[i + 1];
-      final segmentLength = dist.as(LengthUnit.Meter, a, b);
-      final samples = (segmentLength / 20.0).ceil().clamp(1, 40);
-
-      for (int s = 0; s <= samples; s++) {
-        final t = s / samples;
-        final sample = LatLng(
-          a.latitude + (b.latitude - a.latitude) * t,
-          a.longitude + (b.longitude - a.longitude) * t,
-        );
-        for (final hz in hazards) {
-          if (dist.as(LengthUnit.Meter, sample, hz) <= radiusMeters) {
-            return true;
-          }
-        }
-      }
-    }
-    return false;
-  }
-
-  List<LatLng> _removeDeadEndLoops(List<LatLng> points) {
-    if (points.length < 3) return points;
-    const Distance dist = Distance();
-    final cleaned = <LatLng>[points.first];
-
-    for (int i = 1; i < points.length - 1; i++) {
-      final prev = cleaned.last;
-      final current = points[i];
-      final next = points[i + 1];
-      final prevToCurrent = dist.as(LengthUnit.Meter, prev, current);
-      final currentToNext = dist.as(LengthUnit.Meter, current, next);
-      final prevToNext = dist.as(LengthUnit.Meter, prev, next);
-
-      // If this point creates a tiny out-and-back detour, skip it.
-      final isLoopish = prevToCurrent < 45 &&
-          currentToNext < 45 &&
-          prevToNext < 30;
-      if (!isLoopish) cleaned.add(current);
-    }
-
-    cleaned.add(points.last);
-    return _prunePolylineLoops(cleaned);
-  }
-
-  List<LatLng> _prunePolylineLoops(List<LatLng> points) {
-    if (points.length < 4) return points;
-    const Distance dist = Distance();
-    final output = List<LatLng>.from(points);
-
-    // Pass 1: remove branch-like loops where path comes back near an older point.
-    bool changed = true;
-    int guard = 0;
-    while (changed && output.length > 6 && guard < 5) {
-      changed = false;
-      guard++;
-      bool broke = false;
-
-      for (int i = 0; i < output.length - 8; i++) {
-        for (int j = i + 6; j < output.length - 1; j++) {
-          final nearReturn = dist.as(LengthUnit.Meter, output[i], output[j]) < 60;
-          if (!nearReturn) continue;
-
-          double branchLength = 0;
-          for (int k = i; k < j; k++) {
-            branchLength += dist.as(LengthUnit.Meter, output[k], output[k + 1]);
-          }
-
-          // Drop only local detour branches, keep long legitimate route sections.
-          if (branchLength < 700) {
-            output.removeRange(i + 1, j);
-            changed = true;
-            broke = true;
-            break;
-          }
-        }
-        if (broke) break;
-      }
-    }
-
-    // Final pass: remove obvious sharp out-and-back zigzags.
-    if (output.length < 3) return output;
-    final finalClean = <LatLng>[output.first];
-    for (int i = 1; i < output.length - 1; i++) {
-      final a = finalClean.last;
-      final b = output[i];
-      final c = output[i + 1];
-
-      final ab = dist.as(LengthUnit.Meter, a, b);
-      final bc = dist.as(LengthUnit.Meter, b, c);
-      final ac = dist.as(LengthUnit.Meter, a, c);
-      final isBacktrackSpike = ab < 140 && bc < 140 && ac < 55;
-
-      if (!isBacktrackSpike) {
-        finalClean.add(b);
-      }
-    }
-    finalClean.add(output.last);
-    return finalClean;
+    return _HomePageRouteService.getSafeAStarRoute(this, verifiedReports);
   }
 
   void _clearRoute() {
@@ -825,407 +456,737 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       _pathIsBlocked = false;
       _isFloodWarningAhead = false;
       _isRerouting = false;
+      _showUserNavStartBar = false;
       _searchController.clear();
       _isAutoCentering = true;
     });
     if (_currentPCPos != null) _animatedMapMove(_currentPCPos!, 15.0);
   }
 
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      backgroundColor: const Color(0xFF0D141D),
-      body: Stack(
-        children: [
-          StreamBuilder<List<Map<String, dynamic>>>(
-            stream: Supabase.instance.client
-                .from('user_reports')
-                .stream(primaryKey: ['id']),
-            builder: (context, reportSnapshot) {
-              final allReports = reportSnapshot.data ?? [];
-              final verifiedReports = _normalizeVerifiedReports(allReports);
+  void _setReroutingState(bool value) {
+    if (!mounted) return;
+    setState(() => _isRerouting = value);
+  }
 
-              // Keep warnings persistent even if stream briefly returns empty.
-              final displayReports = verifiedReports.isNotEmpty
-                  ? verifiedReports
-                  : _cachedVerifiedReports;
-              if (verifiedReports.isNotEmpty &&
-                  verifiedReports.length != _cachedVerifiedReports.length) {
-                WidgetsBinding.instance.addPostFrameCallback((_) {
-                  if (mounted) {
-                    setState(() {
-                      _cachedVerifiedReports = verifiedReports;
-                    });
-                  }
-                });
-              }
+  void _applyRerouteSuccess(List<LatLng> points) {
+    if (!mounted) return;
+    setState(() {
+      _routePoints = points;
+      _isRerouting = false;
+      _pathIsBlocked = false;
+      _isFloodWarningAhead = false;
+      if (!widget.isRescuerAccount && _destinationPos != null) {
+        _showUserNavStartBar = true;
+      }
+    });
+    _fitMapToPoints(_routePoints);
+  }
 
-              WidgetsBinding.instance.addPostFrameCallback(
-                (_) => _checkRouteForFloods(displayReports),
-              );
+  void _showRerouteFailure(String message, {required bool connected}) {
+    if (!mounted) return;
+    setState(() {
+      _isRerouting = false;
+      if (!widget.isRescuerAccount) {
+        _showUserNavStartBar = false;
+      }
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          connected
+              ? "$message Tried wider detour but no valid safe route."
+              : message,
+        ),
+        backgroundColor: Colors.red,
+      ),
+    );
+  }
 
-              return FlutterMap(
-                mapController: _mapController,
-                options: MapOptions(
-                  initialCenter: _currentPCPos ?? _cituLocation,
-                  initialZoom: 15.0,
-                  onPositionChanged: (pos, hasGesture) {
-                    if (hasGesture && _isAutoCentering) {
-                      setState(() => _isAutoCentering = false);
-                    }
-                  },
-                ),
-                children: [
-                  if (_useMapbox)
-                    TileLayer(
-                      urlTemplate:
-                          'https://api.mapbox.com/styles/v1/$_mapboxStyleId/tiles/256/{z}/{x}/{y}@2x?access_token=$_mapboxToken',
-                      additionalOptions: const {'accessToken': _mapboxToken},
-                      userAgentPackageName: 'com.floote.app',
-                    )
-                  else
-                    TileLayer(
-                      urlTemplate:
-                          'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-                      userAgentPackageName: 'com.floote.app',
-                    ),
+  List<Polyline> _buildMapPolylines() {
+    if (_routePoints.length < 2) return const <Polyline>[];
+    return [
+      Polyline(
+        points: _routePoints,
+        color: _pathIsBlocked ? _dangerColor.withAlpha(180) : _accentColor,
+        strokeWidth: _pathIsBlocked ? 7 : 6,
+      ),
+    ];
+  }
 
-                  PolylineLayer(
-                    polylines: [
-                      Polyline(
-                        points: _routePoints,
-                        color: _pathIsBlocked
-                            ? _dangerColor.withAlpha(180)
-                            : _accentColor,
-                        strokeWidth: _pathIsBlocked ? 6.0 : 5.0,
-                        borderColor: Colors.black.withAlpha(80),
-                        borderStrokeWidth: 1.2,
-                      ),
-                      ..._buildHazardRadiusRings(displayReports),
-                    ],
-                  ),
+  List<CircleMarker> _buildHazardCircles(List<Map<String, dynamic>> reports) {
+    final circles = <CircleMarker>[];
+    for (final report in reports) {
+      final decision = (report['admin_decision'] ?? '')
+          .toString()
+          .trim()
+          .toLowerCase();
+      if (decision != 'impassable' && decision != 'risky') continue;
+      final lat = _toDouble(report['latitude']);
+      final lng = _toDouble(report['longitude']);
+      if (lat == null || lng == null) continue;
+      final isImpassable = decision == 'impassable';
+      final radius = isImpassable ? 150.0 : 80.0;
+      final stroke = isImpassable
+          ? _dangerColor.withAlpha(220)
+          : Colors.orangeAccent.withAlpha(220);
+      circles.add(
+        CircleMarker(
+          point: LatLng(lat, lng),
+          radius: radius,
+          useRadiusInMeter: true,
+          borderColor: stroke,
+          borderStrokeWidth: 2,
+          color: stroke.withAlpha(50),
+        ),
+      );
+    }
+    return circles;
+  }
 
-                  MarkerLayer(
-                    markers: [
-                      ...displayReports.map(
-                        (r) => Marker(
-                          point: LatLng(r['latitude'], r['longitude']),
-                          width: 52,
-                          height: 52,
-                          child: GestureDetector(
-                            onTap: () => _showReportDetails(r),
-                            child: AnimatedBuilder(
-                              animation: _pulseController,
-                              builder: (context, child) {
-                                final glow =
-                                    0.35 + (0.65 * _pulseController.value);
-                                return Transform.scale(
-                                  scale: 0.92 + (0.16 * _pulseController.value),
-                                  child: Container(
-                                    decoration: BoxDecoration(
-                                      shape: BoxShape.circle,
-                                      boxShadow: [
-                                        BoxShadow(
-                                          color: _getDecisionColor(
-                                            r['admin_decision'],
-                                          ).withAlpha((120 * glow).toInt()),
-                                          blurRadius: 16,
-                                          spreadRadius: 2,
-                                        ),
-                                      ],
-                                    ),
-                                    child: child,
-                                  ),
-                                );
-                              },
-                              child: Icon(
-                                Icons.warning_rounded,
-                                color: _getDecisionColor(r['admin_decision']),
-                                size: 36,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                      if (_destinationPos != null)
-                        Marker(
-                          point: _destinationPos!,
-                          width: 44,
-                          height: 44,
-                          child: AnimatedBuilder(
-                            animation: _pulseController,
-                            builder: (context, child) => Transform.translate(
-                              offset: Offset(0, -3 * _pulseController.value),
-                              child: child,
-                            ),
-                            child: const Icon(
-                              Icons.location_on,
-                              color: Colors.red,
-                              size: 42,
-                            ),
-                          ),
-                        ),
-                      if (_currentPCPos != null)
-                        Marker(
-                          point: _currentPCPos!,
-                          width: 70,
-                          height: 70,
-                          child: AnimatedBuilder(
-                            animation: _pulseController,
-                            builder: (context, child) => Transform.rotate(
-                              angle: (_currentHeading * (3.14159 / 180)),
-                              child: Stack(
-                                alignment: Alignment.center,
-                                children: [
-                                  Container(
-                                    width: 56 + (8 * _pulseController.value),
-                                    height: 56 + (8 * _pulseController.value),
-                                    decoration: BoxDecoration(
-                                      shape: BoxShape.circle,
-                                      color: _accentColor.withAlpha(35),
-                                    ),
-                                  ),
-                                  Container(
-                                    width: 40,
-                                    height: 40,
-                                    decoration: BoxDecoration(
-                                      color: const Color(
-                                        0xFF061018,
-                                      ).withAlpha(180),
-                                      shape: BoxShape.circle,
-                                      border: Border.all(
-                                        color: _accentColor.withAlpha(200),
-                                        width: 1.6,
-                                      ),
-                                    ),
-                                  ),
-                                  const Icon(
-                                    Icons.navigation,
-                                    color: _accentColor,
-                                    size: 32,
-                                  ),
-                                ],
-                              ),
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
+  Color _markerColorForDecision(String? decision) {
+    final value = (decision ?? '').trim().toLowerCase();
+    if (value == 'impassable') return Colors.redAccent;
+    if (value == 'risky') return Colors.orangeAccent;
+    return Colors.lightBlueAccent;
+  }
 
-                  RichAttributionWidget(
-                    attributions: [
-                      if (_useMapbox)
-                        TextSourceAttribution(
-                          'Mapbox',
-                          onTap: () => debugPrint('Mapbox attribution tapped'),
-                        )
-                      else
-                        TextSourceAttribution(
-                          'OpenStreetMap contributors',
-                          onTap: () =>
-                              debugPrint('OpenStreetMap attribution tapped'),
-                        ),
-                    ],
+  List<Marker> _buildMapMarkers(List<Map<String, dynamic>> reports) {
+    final markers = <Marker>[];
+    for (final r in reports) {
+      final lat = _toDouble(r['latitude']);
+      final lng = _toDouble(r['longitude']);
+      if (lat == null || lng == null) continue;
+      markers.add(
+        Marker(
+          point: LatLng(lat, lng),
+          width: 38,
+          height: 38,
+          child: GestureDetector(
+            onTap: () => _showReportDetails(r),
+            child: Container(
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: _markerColorForDecision(r['admin_decision']?.toString()),
+                border: Border.all(color: Colors.white, width: 1.8),
+                boxShadow: const [
+                  BoxShadow(
+                    color: Colors.black45,
+                    blurRadius: 8,
+                    offset: Offset(0, 2),
                   ),
                 ],
-              );
-            },
+              ),
+              child: const Icon(Icons.warning_amber_rounded, color: Colors.white, size: 20),
+            ),
           ),
+        ),
+      );
+    }
 
-          _buildMapMoodOverlay(),
-
-          _buildTopSearchBar(),
-          _buildStatusStrip(),
-          _buildWaterLevelStrip(),
-          _buildSOSButton(),
-          _buildFollowToggle(),
-          _buildZoomControls(),
-
-          // WARNING BAR (RED)
-          AnimatedPositioned(
-            duration: const Duration(milliseconds: 300),
-            curve: Curves.easeOut,
-            bottom: _pathIsBlocked ? 0 : -96,
-            left: 0,
-            right: 0,
-            child: GestureDetector(
-              onTap: () async {
-                final response = await Supabase.instance.client
-                    .from('user_reports')
-                    .select();
-                final reports = _normalizeVerifiedReports(
-                  List<Map<String, dynamic>>.from(response),
-                );
-                _getSafeAStarRoute(reports);
-              },
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  vertical: 16,
-                  horizontal: 22,
+    if (_destinationPos != null) {
+      markers.add(
+        Marker(
+          point: _destinationPos!,
+          width: 40,
+          height: 40,
+          child: Container(
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: const Color(0xFF1E88E5),
+              border: Border.all(color: Colors.white, width: 2),
+              boxShadow: const [
+                BoxShadow(
+                  color: Colors.black38,
+                  blurRadius: 8,
+                  offset: Offset(0, 2),
                 ),
-                decoration: BoxDecoration(
-                  color: _dangerColor,
-                  boxShadow: [
-                    BoxShadow(
-                      color: _dangerColor.withAlpha(110),
-                      blurRadius: 24,
-                      offset: const Offset(0, -4),
-                    ),
-                  ],
+              ],
+            ),
+            child: const Icon(Icons.flag, color: Colors.white, size: 20),
+          ),
+        ),
+      );
+    }
+
+    if (_currentPCPos != null) {
+      markers.add(
+        Marker(
+          point: _currentPCPos!,
+          width: 44,
+          height: 44,
+          child: Transform.rotate(
+            angle: _currentHeading * 3.1415926535897932 / 180.0,
+            child: Container(
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: const Color(0xFF00B8FF),
+                border: Border.all(color: Colors.white, width: 2),
+                boxShadow: const [
+                  BoxShadow(
+                    color: Colors.black45,
+                    blurRadius: 10,
+                    offset: Offset(0, 2),
+                  ),
+                ],
+              ),
+              child: const Icon(Icons.navigation, color: Colors.white, size: 24),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return markers;
+  }
+
+  Widget _buildMap(List<Map<String, dynamic>> displayReports) {
+    if (_useNavigationMapLayer) {
+      return _buildAndroidNavigationMap(displayReports);
+    }
+    final initial = _currentPCPos ?? _cebuLocation;
+    final initialZoom =
+        _currentPCPos == null ? _cebuFallbackZoom : _mapZoom;
+    _isMapReady = true;
+    return FlutterMap(
+      mapController: _mapController,
+      options: MapOptions(
+        initialCenter: initial,
+        initialZoom: initialZoom,
+        onPositionChanged: (position, hasGesture) {
+          _mapCenter = position.center;
+          _mapZoom = position.zoom;
+        },
+      ),
+      children: [
+        TileLayer(
+          urlTemplate: _darkTileUrl,
+          subdomains: const ['a', 'b', 'c', 'd'],
+          userAgentPackageName: 'com.example.first',
+        ),
+        CircleLayer(circles: _buildHazardCircles(displayReports)),
+        PolylineLayer(polylines: _buildMapPolylines()),
+        MarkerLayer(markers: _buildMapMarkers(displayReports)),
+      ],
+    );
+  }
+
+  Widget _buildAndroidNavigationMap(List<Map<String, dynamic>> displayReports) {
+    final initial = _currentPCPos ?? _cebuLocation;
+    final initialZoom =
+        _currentPCPos == null ? _cebuFallbackZoom : _mapZoom;
+    if (!_androidNavMapReady) {
+      return Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const CircularProgressIndicator(color: _accentColor),
+              const SizedBox(height: 12),
+              Text(
+                _androidNavMapError ?? 'Preparing Navigation SDK map layer...',
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white70),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+    _isMapReady = true;
+    final digest = _buildAndroidOverlayDigest(displayReports);
+    if (digest != _androidOverlayDigest) {
+      _androidOverlayDigest = digest;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        unawaited(_syncAndroidNavigationMapOverlays(displayReports));
+      });
+    }
+    return Stack(
+      children: [
+        gnav.GoogleMapsMapView(
+          onViewCreated: (controller) {
+            _androidMapController = controller;
+            _androidOverlayDigest = '';
+            unawaited(_syncAndroidNavigationMapOverlays(displayReports));
+            unawaited(() async {
+              try {
+                await controller.setMyLocationEnabled(true);
+                await controller.setMapType(mapType: gnav.MapType.normal);
+                await controller.setMapColorScheme(gnav.MapColorScheme.light);
+                await controller.setMapStyle('[]');
+                await Future<void>.delayed(const Duration(milliseconds: 700));
+                await controller.setMapType(mapType: gnav.MapType.normal);
+                await controller.setMapColorScheme(gnav.MapColorScheme.light);
+                await controller.setMapStyle('[]');
+              } catch (e) {
+                debugPrint('home map style apply failed: $e');
+              }
+            }());
+          },
+          onCameraMove: (position) {
+            _mapCenter = LatLng(
+              position.target.latitude,
+              position.target.longitude,
+            );
+            _mapZoom = position.zoom;
+          },
+          onCameraIdle: (position) {
+            _mapCenter = LatLng(
+              position.target.latitude,
+              position.target.longitude,
+            );
+            _mapZoom = position.zoom;
+          },
+          onMarkerClicked: _handleAndroidMapMarkerClicked,
+          initialMapType: gnav.MapType.normal,
+          initialMapColorScheme: gnav.MapColorScheme.light,
+          initialCameraPosition: gnav.CameraPosition(
+            target: gnav.LatLng(
+              latitude: initial.latitude,
+              longitude: initial.longitude,
+            ),
+            zoom: initialZoom,
+          ),
+        ),
+        Positioned(
+          right: 14,
+          bottom: 14,
+          child: DecoratedBox(
+            decoration: BoxDecoration(
+              color: const Color(0xC6111A24),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+              child: Text(
+                'Reports: ${displayReports.length}',
+                style: const TextStyle(
+                  color: Colors.white70,
+                  fontWeight: FontWeight.w700,
+                  fontSize: 11,
                 ),
-                child: const Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.alt_route, color: Colors.white, size: 20),
-                    SizedBox(width: 15),
-                    Flexible(
-                      child: Text(
-                        "Hazard ahead! Tap to get an alternate route.",
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontWeight: FontWeight.bold,
-                          fontSize: 13,
-                        ),
-                        overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Future<void> _fitMapToPoints(List<LatLng> points) async {
+    if (!_isMapReady || points.isEmpty) return;
+    if (points.length == 1) {
+      _safeMapMove(points.first, 17.0);
+      return;
+    }
+
+    double minLat = points.first.latitude;
+    double maxLat = points.first.latitude;
+    double minLng = points.first.longitude;
+    double maxLng = points.first.longitude;
+
+    for (final point in points) {
+      if (point.latitude < minLat) minLat = point.latitude;
+      if (point.latitude > maxLat) maxLat = point.latitude;
+      if (point.longitude < minLng) minLng = point.longitude;
+      if (point.longitude > maxLng) maxLng = point.longitude;
+    }
+
+    final center = LatLng((minLat + maxLat) / 2, (minLng + maxLng) / 2);
+    final latSpan = (maxLat - minLat).abs().clamp(0.0001, 180.0);
+    final zoom = latSpan > 1.5
+        ? 9.5
+        : latSpan > 0.8
+            ? 10.5
+            : latSpan > 0.4
+                ? 11.5
+                : latSpan > 0.2
+                    ? 12.5
+                    : latSpan > 0.1
+                        ? 13.5
+                        : latSpan > 0.05
+                            ? 14.5
+                            : latSpan > 0.02
+                                ? 15.5
+                                : 16.4;
+    _safeMapMove(center, zoom);
+  }
+
+  String _buildAndroidOverlayDigest(List<Map<String, dynamic>> reports) {
+    final b = StringBuffer()
+      ..write('r=')
+      ..write(reports.length)
+      ..write('|p=')
+      ..write(_routePoints.length)
+      ..write('|d=')
+      ..write(_destinationPos?.latitude.toStringAsFixed(5) ?? '-')
+      ..write(',')
+      ..write(_destinationPos?.longitude.toStringAsFixed(5) ?? '-')
+      ..write('|c=')
+      ..write(_currentPCPos?.latitude.toStringAsFixed(5) ?? '-')
+      ..write(',')
+      ..write(_currentPCPos?.longitude.toStringAsFixed(5) ?? '-')
+      ..write('|h=')
+      ..write(_currentHeading.toStringAsFixed(1));
+    for (final report in reports) {
+      final lat = _toDouble(report['latitude']);
+      final lng = _toDouble(report['longitude']);
+      final decision = (report['admin_decision'] ?? '').toString();
+      b
+        ..write('|')
+        ..write(report['id'] ?? '')
+        ..write(':')
+        ..write(lat?.toStringAsFixed(5) ?? '-')
+        ..write(',')
+        ..write(lng?.toStringAsFixed(5) ?? '-')
+        ..write(':')
+        ..write(decision);
+    }
+    if (_routePoints.isNotEmpty) {
+      final first = _routePoints.first;
+      final last = _routePoints.last;
+      b
+        ..write('|rf=')
+        ..write(first.latitude.toStringAsFixed(5))
+        ..write(',')
+        ..write(first.longitude.toStringAsFixed(5))
+        ..write('|rl=')
+        ..write(last.latitude.toStringAsFixed(5))
+        ..write(',')
+        ..write(last.longitude.toStringAsFixed(5));
+    }
+    return b.toString();
+  }
+
+  Future<void> _syncAndroidNavigationMapOverlays(
+    List<Map<String, dynamic>> reports,
+  ) async {
+    if (!_useNavigationMapLayer || !_androidNavMapReady) return;
+    final controller = _androidMapController;
+    if (controller == null) return;
+    try {
+      final bluePin = await _ensureAndroidBluePinDescriptor();
+      await controller.clear();
+      _androidHazardReportByMarkerId.clear();
+
+      final hazardMarkerOptions = <gnav.MarkerOptions>[];
+      final hazardMarkerReports = <Map<String, dynamic>>[];
+      for (final report in reports) {
+        final lat = _toDouble(report['latitude']);
+        final lng = _toDouble(report['longitude']);
+        if (lat == null || lng == null) continue;
+        hazardMarkerReports.add(report);
+        hazardMarkerOptions.add(
+          gnav.MarkerOptions(
+            position: gnav.LatLng(latitude: lat, longitude: lng),
+            infoWindow: gnav.InfoWindow(
+              title: 'Flood report',
+              snippet: (report['admin_decision'] ?? '').toString(),
+            ),
+          ),
+        );
+      }
+
+      if (hazardMarkerOptions.isNotEmpty) {
+        final addedHazardMarkers = await controller.addMarkers(
+          hazardMarkerOptions,
+        );
+        for (var i = 0; i < addedHazardMarkers.length; i++) {
+          final marker = addedHazardMarkers[i];
+          if (marker == null || i >= hazardMarkerReports.length) continue;
+          _androidHazardReportByMarkerId[marker.markerId] =
+              hazardMarkerReports[i];
+        }
+      }
+
+      final markerOptions = <gnav.MarkerOptions>[];
+      if (_destinationPos != null) {
+        markerOptions.add(
+          gnav.MarkerOptions(
+            position: gnav.LatLng(
+              latitude: _destinationPos!.latitude,
+              longitude: _destinationPos!.longitude,
+            ),
+            icon: bluePin,
+            infoWindow: const gnav.InfoWindow(title: 'Destination'),
+          ),
+        );
+      }
+
+      if (_currentPCPos != null) {
+        markerOptions.add(
+          gnav.MarkerOptions(
+            position: gnav.LatLng(
+              latitude: _currentPCPos!.latitude,
+              longitude: _currentPCPos!.longitude,
+            ),
+            icon: bluePin,
+            rotation: _currentHeading,
+            infoWindow: const gnav.InfoWindow(title: 'You'),
+          ),
+        );
+      }
+
+      if (markerOptions.isNotEmpty) {
+        await controller.addMarkers(markerOptions);
+      }
+
+      final circleOptions = <gnav.CircleOptions>[];
+      for (final report in reports) {
+        final decision = (report['admin_decision'] ?? '')
+            .toString()
+            .trim()
+            .toLowerCase();
+        if (decision != 'impassable' && decision != 'risky') continue;
+        final lat = _toDouble(report['latitude']);
+        final lng = _toDouble(report['longitude']);
+        if (lat == null || lng == null) continue;
+        final isImpassable = decision == 'impassable';
+        final stroke = isImpassable
+            ? _dangerColor.withAlpha(220)
+            : Colors.orangeAccent.withAlpha(220);
+        circleOptions.add(
+          gnav.CircleOptions(
+            position: gnav.LatLng(latitude: lat, longitude: lng),
+            radius: isImpassable ? 150.0 : 80.0,
+            strokeColor: stroke,
+            strokeWidth: 2,
+            fillColor: stroke.withAlpha(50),
+            zIndex: 1,
+          ),
+        );
+      }
+      if (circleOptions.isNotEmpty) {
+        await controller.addCircles(circleOptions);
+      }
+
+      if (_routePoints.length >= 2) {
+        await controller.addPolylines([
+          gnav.PolylineOptions(
+            points: _routePoints
+                .map(
+                  (point) => gnav.LatLng(
+                    latitude: point.latitude,
+                    longitude: point.longitude,
+                  ),
+                )
+                .toList(),
+            strokeColor: _pathIsBlocked
+                ? _dangerColor.withAlpha(180)
+                : _accentColor,
+            strokeWidth: _pathIsBlocked ? 7 : 6,
+            zIndex: 2,
+          ),
+        ]);
+      }
+    } catch (e) {
+      debugPrint('home map overlay sync failed: $e');
+    }
+  }
+
+  Future<gnav.ImageDescriptor> _ensureAndroidBluePinDescriptor() async {
+    final existing = _androidBluePinDescriptor;
+    if (existing != null) return existing;
+    final byteData = await _buildBluePinIconByteData();
+    final descriptor = await gnav.registerBitmapImage(
+      bitmap: byteData,
+      imagePixelRatio: 2,
+      width: 36,
+      height: 44,
+    );
+    _androidBluePinDescriptor = descriptor;
+    return descriptor;
+  }
+
+  Future<ByteData> _buildBluePinIconByteData() async {
+    const width = 72.0;
+    const height = 88.0;
+    const cx = width / 2;
+    const circleRadius = 24.0;
+
+    final recorder = ui.PictureRecorder();
+    final canvas = Canvas(recorder, const Rect.fromLTWH(0, 0, width, height));
+
+    final fill = Paint()
+      ..color = const Color(0xFF1E88E5)
+      ..isAntiAlias = true;
+    final stroke = Paint()
+      ..color = const Color(0xFFFFFFFF)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 4
+      ..isAntiAlias = true;
+
+    canvas.drawCircle(const Offset(cx, 30), circleRadius, fill);
+    canvas.drawCircle(const Offset(cx, 30), circleRadius, stroke);
+
+    final tail = ui.Path()
+      ..moveTo(cx, 80)
+      ..lineTo(cx - 13, 47)
+      ..lineTo(cx + 13, 47)
+      ..close();
+    canvas.drawPath(tail, fill);
+    canvas.drawPath(tail, stroke);
+
+    canvas.drawCircle(
+      const Offset(cx, 30),
+      8,
+      Paint()
+        ..color = const Color(0xFFFFFFFF)
+        ..isAntiAlias = true,
+    );
+
+    final image = await recorder.endRecording().toImage(
+      width.toInt(),
+      height.toInt(),
+    );
+    final bytes = await image.toByteData(format: ui.ImageByteFormat.png);
+    if (bytes == null) {
+      throw Exception('Could not encode blue pin icon.');
+    }
+    return bytes;
+  }
+
+  void _handleAndroidMapMarkerClicked(String markerId) {
+    final report = _androidHazardReportByMarkerId[markerId];
+    if (report != null) {
+      _showReportDetails(report);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final mapTabIndex = widget.isRescuerAccount ? 1 : 0;
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF0D141D),
+      body: _bottomNavIndex == mapTabIndex
+          ? Stack(
+              children: [
+                StreamBuilder<List<Map<String, dynamic>>>(
+                  stream: Supabase.instance.client
+                      .from('user_reports')
+                      .stream(primaryKey: ['id']),
+                  builder: (context, reportSnapshot) {
+                    final allReports = reportSnapshot.data ?? [];
+                    final verifiedReports = _normalizeVerifiedReports(
+                      allReports,
+                    );
+
+                    // Keep warnings persistent even if stream briefly returns empty.
+                    final displayReports = verifiedReports.isNotEmpty
+                        ? verifiedReports
+                        : _cachedVerifiedReports;
+                    if (verifiedReports.isNotEmpty &&
+                        verifiedReports.length !=
+                            _cachedVerifiedReports.length) {
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        if (mounted) {
+                          setState(() {
+                            _cachedVerifiedReports = verifiedReports;
+                          });
+                        }
+                      });
+                    }
+
+                    WidgetsBinding.instance.addPostFrameCallback(
+                      (_) => _checkRouteForFloods(displayReports),
+                    );
+
+                    return _buildMap(displayReports);
+                  },
+                ),
+
+                _buildMapMoodOverlay(),
+
+                _buildTopSearchBar(),
+                _buildStatusStrip(),
+                _buildWaterLevelStrip(),
+                _buildSOSButton(),
+                _buildFollowToggle(),
+                _buildZoomControls(),
+
+                // WARNING BAR (RED)
+                AnimatedPositioned(
+                  duration: const Duration(milliseconds: 300),
+                  curve: Curves.easeOut,
+                  bottom: _pathIsBlocked ? 0 : -96,
+                  left: 0,
+                  right: 0,
+                  child: GestureDetector(
+                    onTap: () async {
+                      final response = await Supabase.instance.client
+                          .from('user_reports')
+                          .select();
+                      final reports = _normalizeVerifiedReports(
+                        List<Map<String, dynamic>>.from(response),
+                      );
+                      _getSafeAStarRoute(reports);
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        vertical: 16,
+                        horizontal: 22,
+                      ),
+                      decoration: BoxDecoration(
+                        color: _dangerColor,
+                        boxShadow: [
+                          BoxShadow(
+                            color: _dangerColor.withAlpha(110),
+                            blurRadius: 24,
+                            offset: const Offset(0, -4),
+                          ),
+                        ],
+                      ),
+                      child: const Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(Icons.alt_route, color: Colors.white, size: 20),
+                          SizedBox(width: 15),
+                          Flexible(
+                            child: Text(
+                              "Hazard ahead! Tap to get an alternate route.",
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                        ],
                       ),
                     ),
-                  ],
+                  ),
                 ),
-              ),
-            ),
-          ),
 
-          if (_isRerouting)
-            Container(
-              color: Colors.black45,
-              child: const Center(
-                child: CircularProgressIndicator(color: _accentColor),
-              ),
-            ),
-        ],
-      ),
+                if (_isRerouting)
+                  Container(
+                    color: Colors.black45,
+                    child: const Center(
+                      child: CircularProgressIndicator(color: _accentColor),
+                    ),
+                  ),
+
+                if (widget.isRescuerAccount && _showRescuerNavStartBar)
+                  _buildRescuerNavigationStartBar(),
+                if (!widget.isRescuerAccount && _showUserNavStartBar)
+                  _buildUserNavigationStartBar(),
+              ],
+            )
+          : widget.isRescuerAccount
+          ? _buildRescuerNonMapBody()
+          : _buildUserNonMapBody(),
       bottomNavigationBar: _buildBottomNav(),
     );
   }
 
   // --- HELPER METHODS ---
   Widget _buildMapMoodOverlay() {
-    return Positioned.fill(
-      child: IgnorePointer(
-        child: Column(
-          children: [
-            Expanded(
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [
-                      const Color(0xFF0B141D).withAlpha(110),
-                      Colors.transparent,
-                    ],
-                  ),
-                ),
-              ),
-            ),
-            Expanded(
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topCenter,
-                    end: Alignment.bottomCenter,
-                    colors: [
-                      Colors.transparent,
-                      const Color(0xFF0B141D).withAlpha(135),
-                    ],
-                  ),
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
+    return _HomePageMapLayers.buildMapMoodOverlay();
   }
 
   Widget _buildTopSearchBar() {
-    return SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-        child: Container(
-          decoration: BoxDecoration(
-            color: Colors.white.withAlpha(232),
-            borderRadius: BorderRadius.circular(22),
-            border: Border.all(color: Colors.white.withAlpha(145), width: 1),
-            boxShadow: const [
-              BoxShadow(
-                color: Colors.black26,
-                blurRadius: 20,
-                offset: Offset(0, 8),
-              ),
-            ],
-          ),
-          child: TypeAheadField<Map<String, dynamic>>(
-            builder: (context, controller, focusNode) {
-              _searchController.value = controller.value;
-              return TextField(
-                controller: controller,
-                focusNode: focusNode,
-                decoration: InputDecoration(
-                  hintText: "Search destination",
-                  hintStyle: TextStyle(
-                    color: Colors.blueGrey.shade400,
-                    fontSize: 14,
-                  ),
-                  prefixIcon: const Icon(
-                    Icons.search_rounded,
-                    color: _accentColor,
-                  ),
-                  suffixIcon: _destinationPos != null
-                      ? IconButton(
-                          icon: const Icon(Icons.close, color: Colors.red),
-                          onPressed: _clearRoute,
-                        )
-                      : const Icon(
-                          Icons.place_outlined,
-                          color: Colors.blueGrey,
-                        ),
-                  border: InputBorder.none,
-                  contentPadding: const EdgeInsets.symmetric(vertical: 15),
-                ),
-              );
-            },
-            suggestionsCallback: (pattern) async =>
-                await _getSearchSuggestions(pattern),
-            itemBuilder: (context, suggestion) => ListTile(
-              leading: const Icon(
-                Icons.pin_drop_outlined,
-                color: _accentColor,
-                size: 18,
-              ),
-              title: Text(
-                suggestion['display_name'] ?? "Unknown",
-                style: const TextStyle(fontSize: 12),
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
-              ),
-            ),
-            onSelected: (suggestion) {
-              final dest = LatLng(
-                double.parse(suggestion['lat']),
-                double.parse(suggestion['lon']),
-              );
-              setState(() {
-                _destinationPos = dest;
-                _isAutoCentering = false;
-                _searchController.text = suggestion['display_name'] ?? "";
-              });
-              _getInitialRoute(dest);
-            },
-          ),
-        ),
-      ),
-    );
+    return _HomePageMapLayers.buildTopSearchBar(this);
   }
 
   Widget _buildStatusStrip() {
@@ -1312,11 +1273,12 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
         final waterLevelCm = _readWaterLevelCm(bestReport);
         final decision = (bestReport['admin_decision'] ?? '').toString();
-        final location =
-            (bestReport['location_name'] ?? 'Nearby area').toString();
+        final location = (bestReport['location_name'] ?? 'Nearby area')
+            .toString();
 
-        final Color levelColor =
-            waterLevelCm >= 80 ? _dangerColor : (waterLevelCm >= 40 ? Colors.orangeAccent : _accentColor);
+        final Color levelColor = waterLevelCm >= 80
+            ? _dangerColor
+            : (waterLevelCm >= 40 ? Colors.orangeAccent : _accentColor);
 
         return Positioned(
           top: MediaQuery.of(context).padding.top + 130,
@@ -1345,7 +1307,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        'Water Level: ${waterLevelCm.toStringAsFixed(1)} cm',
+                        'Water Level: ${formatSensorReading(waterLevelCm)} cm',
                         style: const TextStyle(
                           color: Colors.white,
                           fontSize: 13,
@@ -1373,157 +1335,38 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     );
   }
 
-  List<Polyline> _buildHazardRadiusRings(List<Map<String, dynamic>> reports) {
-    const Distance distance = Distance();
-    final List<Polyline> rings = [];
-
-    for (final report in reports) {
-      final decision = (report['admin_decision'] ?? '').toString();
-      if (decision != 'Impassable' && decision != 'Risky') continue;
-
-      final lat = (report['latitude'] as num?)?.toDouble();
-      final lng = (report['longitude'] as num?)?.toDouble();
-      if (lat == null || lng == null) continue;
-
-      final center = LatLng(lat, lng);
-      final radiusMeters = decision == 'Impassable' ? 150.0 : 80.0;
-      final ringColor = decision == 'Impassable'
-          ? _dangerColor.withAlpha(220)
-          : Colors.orangeAccent.withAlpha(220);
-
-      // Draw a broken circle using many short arc segments.
-      const int segments = 36; // 10 degrees each around the circle
-      for (int i = 0; i < segments; i++) {
-        if (i.isOdd) continue; // every other segment is skipped (gap)
-
-        final startBearing = i * (360.0 / segments);
-        final midBearing = startBearing + 4.0;
-        final endBearing = startBearing + 8.0;
-
-        final p1 = distance.offset(center, radiusMeters, startBearing);
-        final p2 = distance.offset(center, radiusMeters, midBearing);
-        final p3 = distance.offset(center, radiusMeters, endBearing);
-
-        rings.add(
-          Polyline(
-            points: [p1, p2, p3],
-            color: ringColor,
-            strokeWidth: 3.0,
-            borderColor: Colors.black.withAlpha(80),
-            borderStrokeWidth: 0.8,
-          ),
-        );
-      }
-    }
-
-    return rings;
-  }
-
-  Map<String, dynamic>? _pickWaterLevelReport(List<Map<String, dynamic>> reports) {
+  Map<String, dynamic>? _pickWaterLevelReport(
+    List<Map<String, dynamic>> reports,
+  ) {
     if (reports.isEmpty) return null;
 
-    final withLevels = reports
-        .where((r) => _readWaterLevelCm(r) > 0)
-        .toList();
+    final withLevels = reports.where((r) => _readWaterLevelCm(r) > 0).toList();
     if (withLevels.isNotEmpty) {
-      withLevels.sort((a, b) => _readWaterLevelCm(b).compareTo(_readWaterLevelCm(a)));
+      withLevels.sort(
+        (a, b) => _readWaterLevelCm(b).compareTo(_readWaterLevelCm(a)),
+      );
       return withLevels.first;
     }
 
     final impassable = reports.firstWhere(
-      (r) => (r['admin_decision'] ?? '').toString() == 'Impassable',
+      (r) =>
+          (r['admin_decision'] ?? '').toString().trim().toLowerCase() ==
+          'impassable',
       orElse: () => reports.first,
     );
     return impassable;
   }
 
   double _readWaterLevelCm(Map<String, dynamic> report) {
-    const keys = ['water_level_cm', 'water_level', 'depth_cm', 'flood_depth_cm'];
-    for (final key in keys) {
-      final value = report[key];
-      if (value is num) return value.toDouble();
-      if (value is String) {
-        final parsed = double.tryParse(value);
-        if (parsed != null) return parsed;
-      }
-    }
-    return 0;
+    return _HomePageHazardWidgets.readWaterLevelCm(report);
   }
 
   void _showReportDetails(Map<String, dynamic> report) {
-    showModalBottomSheet(
-      context: context,
-      backgroundColor: Colors.transparent,
-      builder: (context) => Container(
-        padding: const EdgeInsets.all(24),
-        decoration: const BoxDecoration(
-          color: Color(0xFF2D3848),
-          borderRadius: BorderRadius.vertical(top: Radius.circular(30)),
-        ),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (report['image_url'] != null)
-              ClipRRect(
-                borderRadius: BorderRadius.circular(15),
-                child: Image.network(
-                  report['image_url'],
-                  height: 180,
-                  width: double.infinity,
-                  fit: BoxFit.cover,
-                ),
-              ),
-            const SizedBox(height: 15),
-            Text(
-              report['location_name'] ?? "Flood Report",
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 22,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            _buildDetailRow(
-              Icons.comment,
-              "Note",
-              report['user_comments'] ?? "No description.",
-            ),
-          ],
-        ),
-      ),
-    );
+    _HomePageHazardWidgets.showReportDetails(this, report);
   }
 
   Widget _buildDetailRow(IconData icon, String label, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 8.0),
-      child: Row(
-        children: [
-          Icon(icon, color: const Color(0xFF00FBFF), size: 20),
-          const SizedBox(width: 12),
-          Text(
-            "$label: ",
-            style: const TextStyle(color: Colors.white70, fontSize: 14),
-          ),
-          Expanded(
-            child: Text(
-              value,
-              style: const TextStyle(
-                color: Colors.white,
-                fontSize: 14,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  Color _getDecisionColor(String? decision) {
-    if (decision == 'Impassable') return Colors.red;
-    if (decision == 'Risky') return Colors.orange;
-    return Colors.transparent;
+    return _HomePageHazardWidgets.buildDetailRow(icon, label, value);
   }
 
   // Search destinations with Mapbox when a token is provided; otherwise use OSM.
@@ -1531,6 +1374,15 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     if (query.length < 3) return [];
 
     try {
+      if (_useGooglePlaces) {
+        final placesSuggestions = await _getGooglePlaceSuggestions(query);
+        if (placesSuggestions.isNotEmpty) return placesSuggestions;
+      }
+
+      if (!_allowLegacySearchFallback) {
+        return [];
+      }
+
       if (_useMapbox) {
         final encodedQuery = Uri.encodeComponent(query);
         final String mapboxUrl =
@@ -1562,9 +1414,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
         final response = await http.get(
           Uri.parse(nominatimUrl),
-          headers: const {
-            'User-Agent': 'floote-app/1.0 (flutter_map_search)',
-          },
+          headers: const {'User-Agent': 'floote-app/1.0 (flutter_map_search)'},
         );
         if (response.statusCode == 200) {
           final List data = json.decode(response.body);
@@ -1585,12 +1435,96 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     return [];
   }
 
+  Future<List<Map<String, dynamic>>> _getGooglePlaceSuggestions(
+    String query,
+  ) async {
+    final center = _currentPCPos ?? _cebuLocation;
+    final uri = Uri.https('places.googleapis.com', '/v1/places:autocomplete');
+    final response = await http.post(
+      uri,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Goog-Api-Key': _googlePlacesApiKey,
+        'X-Goog-FieldMask':
+            'suggestions.placePrediction.placeId,suggestions.placePrediction.text.text',
+      },
+      body: json.encode({
+        'input': query,
+        'languageCode': 'en',
+        'regionCode': 'PH',
+        'locationBias': {
+          'circle': {
+            'center': {
+              'latitude': center.latitude,
+              'longitude': center.longitude,
+            },
+            'radius': 50000.0,
+          },
+        },
+      }),
+    );
+
+    if (response.statusCode != 200) {
+      debugPrint('Google Places autocomplete error: ${response.statusCode}');
+      return [];
+    }
+
+    final data = json.decode(response.body) as Map<String, dynamic>;
+    final suggestions = (data['suggestions'] as List?) ?? const [];
+    return suggestions
+        .map((entry) => entry['placePrediction'])
+        .whereType<Map>()
+        .map<Map<String, dynamic>>((prediction) {
+          final placeId = prediction['placeId']?.toString();
+          final text = (prediction['text'] as Map?)?['text']?.toString();
+          if (placeId == null ||
+              placeId.isEmpty ||
+              text == null ||
+              text.isEmpty) {
+            return const <String, dynamic>{};
+          }
+          return {'display_name': text, 'place_id': placeId};
+        })
+        .where((entry) => entry.isNotEmpty)
+        .toList();
+  }
+
+  Future<LatLng?> _fetchGooglePlaceLocation(String placeId) async {
+    final encodedPlaceId = Uri.encodeComponent(placeId);
+    final uri = Uri.https(
+      'places.googleapis.com',
+      '/v1/places/$encodedPlaceId',
+    );
+    final response = await http.get(
+      uri,
+      headers: {
+        'X-Goog-Api-Key': _googlePlacesApiKey,
+        'X-Goog-FieldMask': 'location',
+      },
+    );
+
+    if (response.statusCode != 200) {
+      debugPrint('Google Place details error: ${response.statusCode}');
+      return null;
+    }
+
+    final data = json.decode(response.body) as Map<String, dynamic>;
+    final location = data['location'];
+    if (location is! Map) return null;
+    final lat = _toDouble(location['latitude']);
+    final lng = _toDouble(location['longitude']);
+    if (lat == null || lng == null) return null;
+    return LatLng(lat, lng);
+  }
+
   Future<void> _fastTrackLocation() async {
     if (_useFixedCurrentLocation) {
       if (mounted) {
-        setState(() => _currentPCPos = _cituLocation);
+        setState(() => _currentPCPos = _cebuLocation);
       }
-      _mapController.move(_cituLocation, 15.0);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _safeMapMove(_cebuLocation, 15.0);
+      });
       return;
     }
 
@@ -1598,47 +1532,78 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
     }
+    if (permission == LocationPermission.denied ||
+        permission == LocationPermission.deniedForever) {
+      if (mounted) setState(() {});
+      return;
+    }
+
     Position? lastPos = await Geolocator.getLastKnownPosition();
+    if (lastPos == null) {
+      try {
+        lastPos = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+          ),
+        );
+      } catch (e) {
+        debugPrint('fastTrack getCurrentPosition: $e');
+      }
+    }
+
     if (lastPos != null && mounted) {
-      setState(
-        () => _currentPCPos = LatLng(lastPos.latitude, lastPos.longitude),
-      );
-      _mapController.move(_currentPCPos!, 15.0);
+      final here = LatLng(lastPos.latitude, lastPos.longitude);
+      setState(() {
+        _currentPCPos = here;
+        _mapCenter = here;
+      });
+      _safeMapMove(here, 15.0);
     }
     _initLocationTracking();
   }
 
-  void _animatedMapMove(LatLng destLocation, double destZoom) {
-    final latTween = Tween<double>(
-      begin: _mapController.camera.center.latitude,
-      end: destLocation.latitude,
-    );
-    final lngTween = Tween<double>(
-      begin: _mapController.camera.center.longitude,
-      end: destLocation.longitude,
-    );
-    final zoomTween = Tween<double>(
-      begin: _mapController.camera.zoom,
-      end: destZoom,
-    );
-    final controller = AnimationController(
-      duration: const Duration(milliseconds: 1000),
-      vsync: this,
-    );
-    final animation = CurvedAnimation(
-      parent: controller,
-      curve: Curves.fastOutSlowIn,
-    );
-    controller.addListener(
-      () => _mapController.move(
-        LatLng(latTween.evaluate(animation), lngTween.evaluate(animation)),
-        zoomTween.evaluate(animation),
+  void _applySelectedDestination(LatLng dest, String displayName) {
+    setState(() {
+      _destinationPos = dest;
+      _isAutoCentering = false;
+      _showUserNavStartBar = false;
+      _searchController.text = displayName;
+    });
+    _getInitialRoute(dest);
+  }
+
+  Future<void> _applySuggestionSelection(
+    Map<String, dynamic> suggestion,
+  ) async {
+    final lat = _toDouble(suggestion['lat']);
+    final lng = _toDouble(suggestion['lon']);
+    final displayName = (suggestion['display_name'] ?? 'Selected destination')
+        .toString();
+    if (lat != null && lng != null) {
+      _applySelectedDestination(LatLng(lat, lng), displayName);
+      return;
+    }
+
+    final placeId = suggestion['place_id']?.toString();
+    if (_useGooglePlaces && placeId != null && placeId.isNotEmpty) {
+      final destination = await _fetchGooglePlaceLocation(placeId);
+      if (destination != null) {
+        _applySelectedDestination(destination, displayName);
+        return;
+      }
+    }
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Unable to resolve selected place. Please try another.'),
+        backgroundColor: Colors.redAccent,
       ),
     );
-    animation.addStatusListener((status) {
-      if (status == AnimationStatus.completed) controller.dispose();
-    });
-    controller.forward();
+  }
+
+  void _animatedMapMove(LatLng destLocation, double destZoom) {
+    _safeMapMove(destLocation, destZoom);
   }
 
   Future<void> _initLocationTracking() async {
@@ -1681,15 +1646,45 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
           }
         });
         if (_isAutoCentering) {
-          _mapController.move(_currentPCPos!, _mapController.camera.zoom);
+          _safeMapMove(_currentPCPos!, _mapZoom);
         }
       }
     });
   }
 
+  void _safeMapMove(LatLng center, double zoom) {
+    if (!_isMapReady) return;
+    try {
+      _mapCenter = center;
+      _mapZoom = zoom;
+      if (_useNavigationMapLayer) {
+        final controller = _androidMapController;
+        if (controller != null) {
+          unawaited(
+            controller.moveCamera(
+              gnav.CameraUpdate.newLatLngZoom(
+                gnav.LatLng(
+                  latitude: center.latitude,
+                  longitude: center.longitude,
+                ),
+                zoom,
+              ),
+            ),
+          );
+        }
+        return;
+      }
+      _mapController.move(center, zoom);
+    } catch (e) {
+      debugPrint('Map move skipped until map is ready: $e');
+    }
+  }
+
   Widget _buildSOSButton() {
+    final hasBottomStartBar =
+        widget.isRescuerAccount ? _showRescuerNavStartBar : _showUserNavStartBar;
     return Positioned(
-      bottom: _pathIsBlocked ? 78 : 28,
+      bottom: hasBottomStartBar ? 92 : (_pathIsBlocked ? 78 : 28),
       right: 20,
       child: AnimatedBuilder(
         animation: _sosController,
@@ -1729,8 +1724,10 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   Widget _buildFollowToggle() {
+    final hasBottomStartBar =
+        widget.isRescuerAccount ? _showRescuerNavStartBar : _showUserNavStartBar;
     return Positioned(
-      bottom: _pathIsBlocked ? 170 : 125,
+      bottom: hasBottomStartBar ? 190 : (_pathIsBlocked ? 170 : 125),
       left: 18,
       child: Column(
         children: [
@@ -1777,8 +1774,10 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   Widget _buildZoomControls() {
+    final hasBottomStartBar =
+        widget.isRescuerAccount ? _showRescuerNavStartBar : _showUserNavStartBar;
     return Positioned(
-      bottom: _pathIsBlocked ? 170 : 125,
+      bottom: hasBottomStartBar ? 190 : (_pathIsBlocked ? 170 : 125),
       right: 18,
       child: Container(
         decoration: BoxDecoration(
@@ -1800,9 +1799,10 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
               tooltip: 'Zoom in',
               icon: const Icon(Icons.add, color: Colors.white),
               onPressed: () {
-                final currentZoom = _mapController.camera.zoom;
+                if (!_isMapReady) return;
+                final currentZoom = _mapZoom;
                 final targetZoom = (currentZoom + 1.0).clamp(3.0, 19.0);
-                _mapController.move(_mapController.camera.center, targetZoom);
+                _safeMapMove(_mapCenter, targetZoom);
               },
             ),
             Container(height: 1, width: 38, color: Colors.white24),
@@ -1810,9 +1810,10 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
               tooltip: 'Zoom out',
               icon: const Icon(Icons.remove, color: Colors.white),
               onPressed: () {
-                final currentZoom = _mapController.camera.zoom;
+                if (!_isMapReady) return;
+                final currentZoom = _mapZoom;
                 final targetZoom = (currentZoom - 1.0).clamp(3.0, 19.0);
-                _mapController.move(_mapController.camera.center, targetZoom);
+                _safeMapMove(_mapCenter, targetZoom);
               },
             ),
           ],
@@ -1821,27 +1822,382 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     );
   }
 
-  Widget _buildBottomNav() {
-    return Container(
-      decoration: BoxDecoration(
-        color: const Color(0xFF101A24),
-        border: Border(top: BorderSide(color: Colors.white.withAlpha(26))),
-        boxShadow: const [BoxShadow(color: Colors.black38, blurRadius: 18)],
-      ),
-      child: BottomNavigationBar(
-        backgroundColor: const Color(0xFF101A24),
-        elevation: 0,
-        selectedItemColor: _accentColor,
-        unselectedItemColor: Colors.blueGrey.shade300,
-        type: BottomNavigationBarType.fixed,
-        items: const [
-          BottomNavigationBarItem(icon: Icon(Icons.explore), label: "Map"),
-          BottomNavigationBarItem(
-            icon: Icon(Icons.notifications),
-            label: "Alerts",
+  /// Placeholder for flood-aware navigation start (wire to FastAPI / route later).
+  Future<void> _handleRescuerStartNavigation() async {
+    final dispatchId = _activeRescueDispatchId;
+    final destination = _activeRescueDestination;
+    if (dispatchId == null || destination == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Accept an SOS with a valid destination before starting navigation.',
           ),
-          BottomNavigationBarItem(icon: Icon(Icons.person), label: "Profile"),
-        ],
+        ),
+      );
+      return;
+    }
+    if (_currentPCPos == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Current GPS is not ready yet. Please try again.'),
+        ),
+      );
+      return;
+    }
+
+    List<Map<String, dynamic>> verifiedReports = _cachedVerifiedReports;
+    try {
+      final response = await Supabase.instance.client.from('user_reports').select();
+      verifiedReports = _normalizeVerifiedReports(
+        List<Map<String, dynamic>>.from(response),
+      );
+      if (verifiedReports.isNotEmpty) {
+        _cachedVerifiedReports = verifiedReports;
+      }
+    } catch (e) {
+      debugPrint('start rescuer nav: user_reports fetch failed: $e');
+    }
+
+    if (!mounted) return;
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => RescuerNavigationPage(
+          dispatchId: dispatchId,
+          ticketNumber: _activeRescueTicketNumber,
+          initialOrigin: _currentPCPos!,
+          initialDestination: destination,
+          initialHazardReports: verifiedReports,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _handleUserStartNavigation() async {
+    final destination = _destinationPos;
+    if (destination == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Select a destination before starting navigation.'),
+        ),
+      );
+      return;
+    }
+    if (_currentPCPos == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Current GPS is not ready yet. Please try again.'),
+        ),
+      );
+      return;
+    }
+
+    List<Map<String, dynamic>> verifiedReports = _cachedVerifiedReports;
+    try {
+      final response = await Supabase.instance.client.from('user_reports').select();
+      verifiedReports = _normalizeVerifiedReports(
+        List<Map<String, dynamic>>.from(response),
+      );
+      if (verifiedReports.isNotEmpty) {
+        _cachedVerifiedReports = verifiedReports;
+      }
+    } catch (e) {
+      debugPrint('start user nav: user_reports fetch failed: $e');
+    }
+
+    if (!mounted) return;
+    await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => UserNavigationPage(
+          initialOrigin: _currentPCPos!,
+          destination: destination,
+          destinationLabel: _searchController.text.trim().isEmpty
+              ? null
+              : _searchController.text.trim(),
+          initialHazardReports: verifiedReports,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRescuerNavigationStartBar() {
+    return Positioned(
+      left: 14,
+      right: 14,
+      bottom: 14,
+      child: SafeArea(
+        top: false,
+        left: false,
+        right: false,
+        child: Material(
+          elevation: 10,
+          borderRadius: BorderRadius.circular(14),
+          color: const Color(0xFF111A24),
+          child: SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: _handleRescuerStartNavigation,
+              style: FilledButton.styleFrom(
+                backgroundColor: _accentColor,
+                foregroundColor: const Color(0xFF0D141D),
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              icon: const Icon(Icons.navigation_rounded, size: 22),
+              label: const Text(
+                'Start',
+                style: TextStyle(
+                  fontWeight: FontWeight.w800,
+                  fontSize: 16,
+                  letterSpacing: 0.4,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildUserNavigationStartBar() {
+    return Positioned(
+      left: 14,
+      right: 14,
+      bottom: 14,
+      child: SafeArea(
+        top: false,
+        left: false,
+        right: false,
+        child: Material(
+          elevation: 10,
+          borderRadius: BorderRadius.circular(14),
+          color: const Color(0xFF111A24),
+          child: SizedBox(
+            width: double.infinity,
+            child: FilledButton.icon(
+              onPressed: _handleUserStartNavigation,
+              style: FilledButton.styleFrom(
+                backgroundColor: _accentColor,
+                foregroundColor: const Color(0xFF0D141D),
+                padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(14),
+                ),
+              ),
+              icon: const Icon(Icons.navigation_rounded, size: 22),
+              label: const Text(
+                'Start',
+                style: TextStyle(
+                  fontWeight: FontWeight.w800,
+                  fontSize: 16,
+                  letterSpacing: 0.4,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBottomNav() {
+    return HomeBottomNav(
+      isRescuerAccount: widget.isRescuerAccount,
+      currentIndex: _bottomNavIndex,
+      onTap: (index) => setState(() => _bottomNavIndex = index),
+      accentColor: _accentColor,
+    );
+  }
+
+  Widget _buildRescuerNonMapBody() {
+    switch (_bottomNavIndex) {
+      case 0:
+        return _buildDashboardTabPage();
+      case 2:
+        return RescuerRescueCenterPage(
+          onDispatchAccepted: ({
+            required String dispatchId,
+            required double latitude,
+            required double longitude,
+            String? ticketNumber,
+          }) {
+            if (!mounted) return;
+            setState(() {
+              _activeRescueDispatchId = dispatchId;
+              _activeRescueTicketNumber = ticketNumber;
+              _activeRescueDestination = LatLng(latitude, longitude);
+              _destinationPos = _activeRescueDestination;
+              _bottomNavIndex = 1;
+              _showRescuerNavStartBar = true;
+            });
+          },
+        );
+      case 3:
+        return const ProfilePage(
+          isRescuerAccount: true,
+          embeddedInShell: true,
+        );
+      default:
+        return _buildBlankTabPage();
+    }
+  }
+
+  Widget _buildUserNonMapBody() {
+    switch (_bottomNavIndex) {
+      case 1:
+        return _buildUserAlertsTabPage();
+      case 2:
+        return const ProfilePage(
+          isRescuerAccount: false,
+          embeddedInShell: true,
+        );
+      default:
+        return _buildBlankTabPage();
+    }
+  }
+
+  Widget _buildUserAlertsTabPage() {
+    return const ColoredBox(
+      color: Color(0xFF0D141D),
+      child: SafeArea(
+        child: Center(
+          child: Text(
+            'Alerts',
+            style: TextStyle(
+              color: Colors.white70,
+              fontSize: 18,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildBlankTabPage() {
+    return const ColoredBox(color: Colors.black);
+  }
+
+  Widget _buildDashboardTabPage() {
+    return ColoredBox(
+      color: const Color(0xFF0D141D),
+      child: SafeArea(
+        child: Column(
+          children: [
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 16),
+              decoration: BoxDecoration(
+                color: const Color(0xFF101A24),
+                border: Border(
+                  bottom: BorderSide(color: Colors.white.withAlpha(26)),
+                ),
+              ),
+              child: const Text(
+                'RESCUER DASHBOARD',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 30,
+                  fontWeight: FontWeight.w800,
+                  letterSpacing: 0.8,
+                ),
+              ),
+            ),
+            RescuerDashboardHeaderCard(
+              isActiveDuty: _isActiveDuty,
+              onDutyChanged: (value) => unawaited(_persistDutyToggle(value)),
+              accentColor: _accentColor,
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 14, 14, 0),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(14),
+                onTap: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => const RescuerSensorNetworkPage(),
+                    ),
+                  );
+                },
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: _panelColor,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: Colors.white.withAlpha(26)),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.sensors, color: Color(0xFF00E4FF)),
+                      SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          'Sensor Network',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      ),
+                      Icon(Icons.chevron_right, color: Colors.white70),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(14, 10, 14, 0),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(14),
+                onTap: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => const RescuerHistoricalLogsPage(),
+                    ),
+                  );
+                },
+                child: Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    color: _panelColor,
+                    borderRadius: BorderRadius.circular(14),
+                    border: Border.all(color: Colors.white.withAlpha(26)),
+                  ),
+                  child: const Row(
+                    children: [
+                      Icon(Icons.history, color: Color(0xFF00E4FF)),
+                      SizedBox(width: 12),
+                      Expanded(
+                        child: Text(
+                          'Historical Data Logs',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.w800,
+                          ),
+                        ),
+                      ),
+                      Icon(Icons.chevron_right, color: Colors.white70),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
       ),
     );
   }

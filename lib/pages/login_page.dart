@@ -1,19 +1,28 @@
 import 'dart:async'; // CRITICAL: This fixes the TimeoutException error
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import '../utils/auth_login.dart';
 import 'register_page.dart';
 import 'location_permission_page.dart';
 import 'forgot_password_page.dart';
 
 class LoginPage extends StatefulWidget {
-  const LoginPage({super.key});
+  const LoginPage({
+    super.key,
+    this.initialBannerText,
+    this.initialBannerSuccess = false,
+  });
+
+  /// Shown once after navigation (e.g. from registration) so the correct screen owns the snackbar.
+  final String? initialBannerText;
+  final bool initialBannerSuccess;
 
   @override
   State<LoginPage> createState() => _LoginPageState();
 }
 
 class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
-  final _emailController = TextEditingController();
+  final _identifierController = TextEditingController();
   final _passwordController = TextEditingController();
   bool _isLoading = false;
   late final AnimationController _bgController;
@@ -30,11 +39,27 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
       vsync: this,
       duration: const Duration(milliseconds: 700),
     )..forward();
+
+    final banner = widget.initialBannerText;
+    if (banner != null && banner.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).clearSnackBars();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(banner),
+            backgroundColor: widget.initialBannerSuccess
+                ? Colors.green
+                : Colors.redAccent,
+          ),
+        );
+      });
+    }
   }
 
   @override
   void dispose() {
-    _emailController.dispose();
+    _identifierController.dispose();
     _passwordController.dispose();
     _bgController.dispose();
     _entryController.dispose();
@@ -42,9 +67,11 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
   }
 
   Future<void> _handleLogin() async {
-    if (_emailController.text.isEmpty || _passwordController.text.isEmpty) {
+    if (_identifierController.text.isEmpty || _passwordController.text.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please enter email and password')),
+        const SnackBar(
+          content: Text('Please enter username/email and password'),
+        ),
       );
       return;
     }
@@ -52,23 +79,78 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
     setState(() => _isLoading = true);
 
     try {
-      // Authenticate with Supabase
-      final response = await Supabase.instance.client.auth
-          .signInWithPassword(
-            email: _emailController.text.trim(),
-            password: _passwordController.text.trim(),
-          )
-          .timeout(const Duration(seconds: 15));
+      final client = Supabase.instance.client;
+      final identifier = normalizeAuthIdentifier(_identifierController.text);
+      String resolvedEmail = identifier;
 
-      if (response.user == null) {
-        if (mounted) {
+      // If user typed a username, resolve to email via [profiles] (lowercase [.eq]).
+      if (!identifier.contains('@')) {
+        try {
+          final profile = await client
+              .from('profiles')
+              .select('email')
+              .eq('username', identifier)
+              .maybeSingle();
+          final emailFromUsername =
+              profile?['email']?.toString().trim().toLowerCase();
+          if (emailFromUsername == null || emailFromUsername.isEmpty) {
+            if (!mounted) return;
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text(kInvalidLoginCredentials),
+                backgroundColor: Colors.redAccent,
+              ),
+            );
+            return;
+          }
+          resolvedEmail = emailFromUsername;
+        } catch (_) {
+          if (!mounted) return;
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text('Login failed. Please try again.'),
+              content: Text(kInvalidLoginCredentials),
               backgroundColor: Colors.redAccent,
             ),
           );
+          return;
         }
+      }
+
+      final emailForAuth = normalizeAuthIdentifier(resolvedEmail);
+
+      final auth = await client.auth.signInWithPassword(
+        email: emailForAuth,
+        password: _passwordController.text.trim(),
+      ).timeout(const Duration(seconds: 15));
+
+      final user = auth.user;
+      if (user == null) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(kInvalidLoginCredentials),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
+        return;
+      }
+
+      final profile = await client
+          .from('profiles')
+          .select('role')
+          .eq('id', user.id)
+          .maybeSingle();
+      final role = (profile?['role'] ?? '').toString().trim().toLowerCase();
+
+      if (role == 'rescuer' || role == 'admin') {
+        await client.auth.signOut();
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(kAccessDenied),
+            backgroundColor: Colors.redAccent,
+          ),
+        );
         return;
       }
 
@@ -81,7 +163,6 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
         );
       }
     } on TimeoutException {
-      // Caught because dart:async is now imported
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
@@ -90,18 +171,22 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
           ),
         );
       }
-    } on AuthException catch (e) {
-      // Specific Supabase auth errors (e.g., invalid credentials)
+    } on AuthException catch (_) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text(e.message), backgroundColor: Colors.redAccent),
+          const SnackBar(
+            content: Text(kInvalidLoginCredentials),
+            backgroundColor: Colors.redAccent,
+          ),
         );
       }
-    } catch (e) {
-      // Fallback for any other unexpected errors
+    } catch (_) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('An unexpected error occurred')),
+          const SnackBar(
+            content: Text(kInvalidLoginCredentials),
+            backgroundColor: Colors.redAccent,
+          ),
         );
       }
     } finally {
@@ -242,9 +327,9 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
                             ),
                             const SizedBox(height: 24),
                             _buildInputField(
-                              label: 'Email',
-                              hint: 'your.email@example.com',
-                              controller: _emailController,
+                              label: 'Username or Email',
+                              hint: 'username or your.email@example.com',
+                              controller: _identifierController,
                             ),
                             const SizedBox(height: 16),
                             _buildInputField(
