@@ -1870,6 +1870,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
           initialOrigin: _currentPCPos!,
           initialDestination: destination,
           initialHazardReports: verifiedReports,
+          initialPreferredPolyline: _routePoints,
         ),
       ),
     );
@@ -1920,6 +1921,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
               ? null
               : _searchController.text.trim(),
           initialHazardReports: verifiedReports,
+          initialPreferredPolyline: _routePoints,
         ),
       ),
     );

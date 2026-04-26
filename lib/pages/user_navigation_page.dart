@@ -13,12 +13,14 @@ class UserNavigationPage extends StatefulWidget {
     required this.destination,
     required this.initialHazardReports,
     this.destinationLabel,
+    this.initialPreferredPolyline = const <LatLng>[],
   });
 
   final LatLng initialOrigin;
   final LatLng destination;
   final List<Map<String, dynamic>> initialHazardReports;
   final String? destinationLabel;
+  final List<LatLng> initialPreferredPolyline;
 
   @override
   State<UserNavigationPage> createState() => _UserNavigationPageState();
@@ -29,6 +31,10 @@ class _UserNavigationPageState extends State<UserNavigationPage> {
   static const Duration _hazardPollInterval = Duration(seconds: 45);
   static const int _maxIntermediateWaypoints = 18;
   static const double _waypointSpacingMeters = 55.0;
+  static const double _preferredRouteEndpointToleranceMeters = 220.0;
+  static const double _offRouteToleranceMeters = 45.0;
+  static const double _routeDestinationToleranceMeters = 90.0;
+  static const double _stationaryToleranceMeters = 12.0;
 
   gnav.GoogleNavigationViewController? _navViewController;
   StreamSubscription<gnav.OnArrivalEvent>? _arrivalSub;
@@ -41,8 +47,10 @@ class _UserNavigationPageState extends State<UserNavigationPage> {
   String _statusText = 'Preparing navigation session...';
   String _routeStatus = 'pending';
   DateTime? _lastRerouteAt;
+  LatLng? _lastRerouteOrigin;
   List<LatLng> _backendPolyline = const <LatLng>[];
   List<Map<String, dynamic>> _latestHazards = const <Map<String, dynamic>>[];
+  String _lastHazardDigest = '';
   static const Distance _distance = Distance();
 
   @override
@@ -86,7 +94,16 @@ class _UserNavigationPageState extends State<UserNavigationPage> {
         if (!mounted) return;
         setState(() => _statusText = 'Guidance: ${event.navInfo.navState.name}');
       });
-      await _recalculateRoute(reason: 'Initial route');
+      final preferred = _buildPreferredInitialResult();
+      if (preferred != null) {
+        await _startGuidanceForResult(
+          origin: widget.initialOrigin,
+          result: preferred,
+          safeStatusText: 'Live guidance via preview safest route.',
+        );
+      } else {
+        await _recalculateRoute(reason: 'Initial route');
+      }
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -133,6 +150,21 @@ class _UserNavigationPageState extends State<UserNavigationPage> {
     _latestHazards = hazards;
     unawaited(_syncHazardOverlays());
 
+    final rerouteNeeded = _shouldReroute(
+      origin: origin,
+      destination: widget.destination,
+      hazards: hazards,
+    );
+    if (!rerouteNeeded) {
+      if (!mounted) return;
+      setState(() {
+        _calculating = false;
+        _routeStatus = 'safe';
+        _statusText = 'Guidance unchanged: current route still safe.';
+      });
+      return;
+    }
+
     var result = await FloodRouteService.fetchRoadFollowingSafestRoute(
       origin: origin,
       destination: widget.destination,
@@ -144,18 +176,187 @@ class _UserNavigationPageState extends State<UserNavigationPage> {
     // pass near reported floods (no clean alternative existed) - we surface
     // that as a banner instead of refusing to navigate.
     if (!mounted) return;
-    if (!result.isUsable) {
+    if (!result.isUsable || !result.isFloodSafe) {
       setState(() {
-        _routeStatus = result.status;
+        _routeStatus = 'no_route';
         _calculating = false;
-        _statusText = result.message;
+        _statusText =
+            'No safe route available right now. Waiting for route/hazard update.';
         _backendPolyline = const <LatLng>[];
       });
       return;
     }
 
-    final navWaypoints = _buildConstrainedWaypoints(result);
+    await _startGuidanceForResult(origin: origin, result: result);
+  }
 
+  bool _shouldKeepCurrentRoute(
+    LatLng origin,
+    LatLng destination,
+    List<Map<String, dynamic>> hazards,
+  ) {
+    if (_backendPolyline.length < 2) return false;
+
+    final distanceToCurrentRoute = _minDistanceToPolylineMeters(
+      origin,
+      _backendPolyline,
+    );
+    // If user is clearly off the active route, we should reroute.
+    if (distanceToCurrentRoute > _offRouteToleranceMeters) return false;
+
+    final currentRouteDestinationGap = _distance.as(
+      LengthUnit.Meter,
+      _backendPolyline.last,
+      destination,
+    );
+    // If destination changed (or active route endpoint is stale), reroute.
+    if (currentRouteDestinationGap > _routeDestinationToleranceMeters) {
+      return false;
+    }
+
+    final impassableHazards = FloodRouteService.extractHazardPoints(
+      hazards,
+      decisions: const {'impassable'},
+    );
+    if (impassableHazards.isEmpty) return true;
+
+    // Keep current guidance only while its corridor remains flood-safe.
+    final intersects = FloodRouteService.routeIntersectsHazards(
+      _backendPolyline,
+      impassableHazards,
+      220.0,
+      endpointToleranceMeters: 260.0,
+    );
+    return !intersects;
+  }
+
+  bool _shouldReroute({
+    required LatLng origin,
+    required LatLng destination,
+    required List<Map<String, dynamic>> hazards,
+  }) {
+    if (_backendPolyline.length < 2) {
+      _lastHazardDigest = _hazardDigest(hazards);
+      return true;
+    }
+
+    final movedSinceLastReroute = _lastRerouteOrigin == null
+        ? double.infinity
+        : _distance.as(LengthUnit.Meter, _lastRerouteOrigin!, origin);
+    final isStationary = movedSinceLastReroute <= _stationaryToleranceMeters;
+
+    final offRoute =
+        _minDistanceToPolylineMeters(origin, _backendPolyline) >
+        _offRouteToleranceMeters;
+    if (offRoute) {
+      _lastHazardDigest = _hazardDigest(hazards);
+      return true;
+    }
+
+    final destinationChanged =
+        _distance.as(LengthUnit.Meter, _backendPolyline.last, destination) >
+        _routeDestinationToleranceMeters;
+    if (destinationChanged) {
+      _lastHazardDigest = _hazardDigest(hazards);
+      return true;
+    }
+
+    final routeUnsafeNow = !_shouldKeepCurrentRoute(origin, destination, hazards);
+    if (routeUnsafeNow) {
+      _lastHazardDigest = _hazardDigest(hazards);
+      return true;
+    }
+
+    final newDigest = _hazardDigest(hazards);
+    final hazardChanged = newDigest != _lastHazardDigest;
+    _lastHazardDigest = newDigest;
+
+    // If user is stationary and current route is still safe, never churn route.
+    if (isStationary) return false;
+
+    // Hazard changed but active route is still safe -> keep stable guidance.
+    if (hazardChanged) return false;
+
+    return false;
+  }
+
+  String _hazardDigest(List<Map<String, dynamic>> hazards) {
+    final items = <String>[];
+    for (final report in hazards) {
+      final decision = (report['admin_decision'] ?? '')
+          .toString()
+          .trim()
+          .toLowerCase();
+      if (decision != 'impassable' && decision != 'risky') continue;
+      final lat = (report['latitude'] as num?)?.toDouble();
+      final lng = (report['longitude'] as num?)?.toDouble();
+      if (lat == null || lng == null) continue;
+      final ts =
+          (report['updated_at'] ?? report['created_at'] ?? '').toString().trim();
+      items.add(
+        '$decision:${lat.toStringAsFixed(5)},${lng.toStringAsFixed(5)}:$ts',
+      );
+    }
+    items.sort();
+    return items.join('|');
+  }
+
+  double _minDistanceToPolylineMeters(LatLng point, List<LatLng> polyline) {
+    if (polyline.isEmpty) return double.infinity;
+    double minDistance = double.infinity;
+    for (final p in polyline) {
+      final d = _distance.as(LengthUnit.Meter, point, p);
+      if (d < minDistance) {
+        minDistance = d;
+      }
+    }
+    return minDistance;
+  }
+
+  FloodRouteResult? _buildPreferredInitialResult() {
+    final raw = widget.initialPreferredPolyline;
+    if (raw.length < 2) return null;
+    final first = raw.first;
+    final last = raw.last;
+    final startGap = _distance.as(
+      LengthUnit.Meter,
+      first,
+      widget.initialOrigin,
+    );
+    final endGap = _distance.as(
+      LengthUnit.Meter,
+      last,
+      widget.destination,
+    );
+    // Only trust preview routes that still match this navigation session's
+    // origin/destination. If the user moved significantly, recalculate fresh.
+    if (startGap > _preferredRouteEndpointToleranceMeters ||
+        endGap > _preferredRouteEndpointToleranceMeters) {
+      return null;
+    }
+    final cleaned = <LatLng>[raw.first];
+    for (int i = 1; i < raw.length; i++) {
+      final p = raw[i];
+      final d = _distance.as(LengthUnit.Meter, cleaned.last, p);
+      if (d >= 4.0 || i == raw.length - 1) {
+        cleaned.add(p);
+      }
+    }
+    if (cleaned.length < 2) return null;
+    return FloodRouteResult(
+      status: 'safe',
+      message: 'Preview safest route loaded.',
+      polyline: cleaned,
+      routeNodeIds: const <String>[],
+    );
+  }
+
+  Future<void> _startGuidanceForResult({
+    required LatLng origin,
+    required FloodRouteResult result,
+    String? safeStatusText,
+  }) async {
+    final navWaypoints = _buildConstrainedWaypoints(result);
     try {
       final routeStatus = await gnav.GoogleMapsNavigator.setDestinations(
         gnav.Destinations(
@@ -179,15 +380,19 @@ class _UserNavigationPageState extends State<UserNavigationPage> {
         );
         unawaited(_syncHazardOverlays());
       }
+      if (!mounted) return;
       setState(() {
         _routeStatus = routeStatus.name;
         _calculating = false;
         _statusText = result.isFloodSafe
-            ? 'Live guidance via safest route (${result.status}).'
+            ? (safeStatusText ?? 'Live guidance via safest route (${result.status}).')
             : result.message;
         _backendPolyline = result.polyline;
+        _lastRerouteOrigin = origin;
+        _lastHazardDigest = _hazardDigest(_latestHazards);
       });
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _calculating = false;
         _routeStatus = 'failed';
