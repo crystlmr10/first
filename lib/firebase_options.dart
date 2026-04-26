@@ -18,7 +18,7 @@ class DefaultFirebaseOptions {
   }
 
   static const FirebaseOptions android = FirebaseOptions(
-    apiKey: 'AIzaSyBODDsBOdgzJXHKnpklx9KfvE_1NUSjcSo',
+    apiKey: 'REDACTED',
     appId: '1:73678620808:android:21177255b49f0e6cf4773d',
     messagingSenderId: '73678620808',
     projectId: 'floote-cddec',
