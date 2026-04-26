@@ -1,0 +1,48 @@
+{
+  "project_info": {
+    "project_number": "73678620808",
+    "project_id": "floote-cddec",
+    "storage_bucket": "floote-cddec.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:73678620808:android:17f10ac4eb76566cf4773d",
+        "android_client_info": {
+          "package_name": "com.android.application"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBODDsBOdgzJXHKnpklx9KfvE_1NUSjcSo"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:73678620808:android:21177255b49f0e6cf4773d",
+        "android_client_info": {
+          "package_name": "com.example.first"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBODDsBOdgzJXHKnpklx9KfvE_1NUSjcSo"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
