@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:google_navigation_flutter/google_navigation_flutter.dart' as gnav;
 import 'package:latlong2/latlong.dart';
@@ -14,6 +15,8 @@ import 'package:first/utils/sensor_reading_format.dart';
 import 'package:first/services/flood_route_service.dart';
 
 import 'emergency_page.dart';
+import 'incident_report_page.dart';
+import 'alerts_page.dart';
 import 'user_navigation_page.dart';
 import 'profile_page.dart';
 import 'rescuer_historical_logs_page.dart';
@@ -1057,7 +1060,17 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   Widget build(BuildContext context) {
     final mapTabIndex = widget.isRescuerAccount ? 1 : 0;
 
-    return Scaffold(
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (bool didPop, Object? result) {
+        if (didPop) return;
+        if (_bottomNavIndex != mapTabIndex) {
+          setState(() => _bottomNavIndex = mapTabIndex);
+        } else {
+          SystemNavigator.pop();
+        }
+      },
+      child: Scaffold(
       backgroundColor: const Color(0xFF0D141D),
       body: _bottomNavIndex == mapTabIndex
           ? Stack(
@@ -1177,6 +1190,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
           ? _buildRescuerNonMapBody()
           : _buildUserNonMapBody(),
       bottomNavigationBar: _buildBottomNav(),
+    ),
     );
   }
 
@@ -2056,6 +2070,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       case 1:
         return _buildUserAlertsTabPage();
       case 2:
+        return const IncidentReportPage();
+      case 3:
         return const ProfilePage(
           isRescuerAccount: false,
           embeddedInShell: true,
@@ -2066,21 +2082,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   Widget _buildUserAlertsTabPage() {
-    return const ColoredBox(
-      color: Color(0xFF0D141D),
-      child: SafeArea(
-        child: Center(
-          child: Text(
-            'Alerts',
-            style: TextStyle(
-              color: Colors.white70,
-              fontSize: 18,
-              fontWeight: FontWeight.w600,
-            ),
-          ),
-        ),
-      ),
-    );
+    return const AlertsPage();
   }
 
   Widget _buildBlankTabPage() {

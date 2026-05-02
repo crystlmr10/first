@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
@@ -43,6 +44,26 @@ class FloodRouteService {
   static const double _impassableRadiusMeters = 220.0;
   static const double _endpointToleranceMeters = 260.0;
   static final http.Client _http = http.Client();
+
+  /// Avoid over-ignoring route safety checks near endpoints.
+  ///
+  /// A large fixed endpoint tolerance can accidentally suppress hazard checks
+  /// across almost the whole path on short routes. We cap tolerance by both:
+  ///  - absolute ceiling (meters), and
+  ///  - fraction of total route length per endpoint.
+  static double _effectiveEndpointTolerance({
+    required double requestedMeters,
+    required double totalRouteMeters,
+  }) {
+    if (requestedMeters <= 0 || totalRouteMeters <= 0) return 0.0;
+    const double absoluteCapMeters = 120.0;
+    const double perEndpointRouteFraction = 0.25; // max 25% each side
+    final byLength = totalRouteMeters * perEndpointRouteFraction;
+    return math.max(
+      0.0,
+      math.min(requestedMeters, math.min(absoluteCapMeters, byLength)),
+    );
+  }
 
   static String get apiUrl =>
       _apiUrlOverride.isNotEmpty
@@ -104,6 +125,10 @@ class FloodRouteService {
       );
     }
     final total = cumulative.last;
+    final effectiveEndpointToleranceMeters = _effectiveEndpointTolerance(
+      requestedMeters: endpointToleranceMeters,
+      totalRouteMeters: total,
+    );
 
     for (int i = 0; i < route.length - 1; i++) {
       final a = route[i];
@@ -114,9 +139,9 @@ class FloodRouteService {
       for (int s = 0; s <= samples; s++) {
         final t = s / samples;
         final distAlong = cumulative[i] + segmentLength * t;
-        if (endpointToleranceMeters > 0) {
-          if (distAlong <= endpointToleranceMeters) continue;
-          if (total - distAlong <= endpointToleranceMeters) continue;
+        if (effectiveEndpointToleranceMeters > 0) {
+          if (distAlong <= effectiveEndpointToleranceMeters) continue;
+          if (total - distAlong <= effectiveEndpointToleranceMeters) continue;
         }
         final sample = LatLng(
           a.latitude + (b.latitude - a.latitude) * t,
@@ -333,6 +358,10 @@ class FloodRouteService {
       );
     }
     final total = cumulative.last;
+    final effectiveEndpointToleranceMeters = _effectiveEndpointTolerance(
+      requestedMeters: _endpointToleranceMeters,
+      totalRouteMeters: total,
+    );
 
     final hits = <LatLng>{};
     for (int i = 0; i < route.length - 1; i++) {
@@ -344,8 +373,8 @@ class FloodRouteService {
       for (int s = 0; s <= samples; s++) {
         final t = s / samples;
         final distAlong = cumulative[i] + segmentLength * t;
-        if (distAlong <= _endpointToleranceMeters) continue;
-        if (total - distAlong <= _endpointToleranceMeters) continue;
+        if (distAlong <= effectiveEndpointToleranceMeters) continue;
+        if (total - distAlong <= effectiveEndpointToleranceMeters) continue;
         final sample = LatLng(
           a.latitude + (b.latitude - a.latitude) * t,
           a.longitude + (b.longitude - a.longitude) * t,

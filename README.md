@@ -2,6 +2,38 @@
 
 Flood-aware routing and dispatch application (Flutter mobile + FastAPI).
 
+## Secrets & local setup
+
+Do **not** commit API keys or `google-services.json`. This repo uses compile-time configuration.
+
+1. **Copy templates**
+   - `cp android/app/google-services.json.example android/app/google-services.json` and replace values from the [Firebase Console](https://console.firebase.google.com/) (download **google-services.json** for your Android app, or merge keys into the example structure).
+   - Set `android/app/src/main/res/values/google_maps_api.xml` to your **Maps SDK for Android** key (replace `YOUR_GOOGLE_MAPS_ANDROID_KEY`), or keep the placeholder until you add a real key.
+
+2. **Dart defines (Supabase + Firebase options)**  
+   Copy `secrets.example.json` to `secrets.json` (gitignored), fill in real values, then run:
+
+   ```bash
+   flutter run --dart-define-from-file=secrets.json
+   ```
+
+   Or pass variables individually:
+
+   ```bash
+   flutter run \
+     --dart-define=SUPABASE_URL=https://YOUR_PROJECT.supabase.co \
+     --dart-define=SUPABASE_ANON_KEY=YOUR_ANON_KEY \
+     --dart-define=FIREBASE_ANDROID_API_KEY=YOUR_KEY \
+     --dart-define=FIREBASE_ANDROID_APP_ID=YOUR_APP_ID \
+     --dart-define=FIREBASE_MESSAGING_SENDER_ID=YOUR_SENDER_ID \
+     --dart-define=FIREBASE_PROJECT_ID=YOUR_PROJECT_ID \
+     --dart-define=FIREBASE_STORAGE_BUCKET=YOUR_BUCKET
+   ```
+
+   Values match the fields in `lib/firebase_options.dart` and `lib/main.dart`.
+
+3. **If keys were ever pushed to a public remote**, rotate them in Google Cloud, Firebase, and Supabase and treat the old keys as compromised.
+
 ## Runtime Flags
 
 Use `--dart-define` to configure providers without code changes:

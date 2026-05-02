@@ -35,6 +35,10 @@ class HomeBottomNav extends StatelessWidget {
               icon: Icon(Icons.notifications),
               label: 'Alerts',
             ),
+            BottomNavigationBarItem(
+              icon: Icon(Icons.report_problem_outlined),
+              label: 'Reports',
+            ),
             BottomNavigationBarItem(icon: Icon(Icons.person), label: 'Profile'),
           ];
 

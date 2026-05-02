@@ -61,6 +61,8 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
   List<LatLng> _backendPolyline = const <LatLng>[];
   List<Map<String, dynamic>> _latestHazards = const <Map<String, dynamic>>[];
   String _lastHazardDigest = '';
+  bool _enRouteSynced = false;
+  bool _closedSynced = false;
 
   @override
   void initState() {
@@ -97,6 +99,7 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
       });
       _arrivalSub = gnav.GoogleMapsNavigator.setOnArrivalListener((event) {
         if (!mounted) return;
+        unawaited(_markDispatchClosedIfNeeded());
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('Arrived at destination.')),
         );
@@ -425,6 +428,7 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
           ),
         );
       }
+      unawaited(_markDispatchEnRouteIfNeeded());
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -432,6 +436,78 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
         _routeStatus = 'failed';
         _statusText = 'Could not start navigation guidance: $e';
       });
+    }
+  }
+
+  Future<void> _markDispatchEnRouteIfNeeded() async {
+    if (_enRouteSynced || widget.dispatchId.trim().isEmpty) return;
+    try {
+      final rpcResult = await Supabase.instance.client.rpc(
+        'set_dispatch_en_route',
+        params: {'p_dispatch_id': widget.dispatchId},
+      );
+      if (rpcResult == true || rpcResult == 'true') {
+        _enRouteSynced = true;
+        return;
+      }
+    } catch (_) {
+      // Fallback below for environments where the RPC is not deployed yet.
+    }
+
+    try {
+      final uid = Supabase.instance.client.auth.currentUser?.id;
+      if (uid == null) return;
+      await Supabase.instance.client
+          .from('sos_dispatches')
+          .update({'status': 'en_route'})
+          .eq('id', widget.dispatchId)
+          .eq('assigned_rescuer_id', uid)
+          .inFilter('status', ['received', 'dispatching', 'en_route']);
+      _enRouteSynced = true;
+    } catch (e) {
+      debugPrint('Failed to mark dispatch en_route: $e');
+    }
+  }
+
+  Future<void> _markDispatchClosedIfNeeded() async {
+    if (_closedSynced || widget.dispatchId.trim().isEmpty) return;
+    try {
+      final rpcResult = await Supabase.instance.client.rpc(
+        'set_dispatch_closed',
+        params: {'p_dispatch_id': widget.dispatchId},
+      );
+      if (rpcResult == true || rpcResult == 'true') {
+        _closedSynced = true;
+        if (mounted) {
+          setState(() {
+            _routeStatus = 'closed';
+            _statusText = 'Dispatch closed: rescuer arrived at destination.';
+          });
+        }
+        return;
+      }
+    } catch (_) {
+      // Fallback below for environments where the RPC is not deployed yet.
+    }
+
+    try {
+      final uid = Supabase.instance.client.auth.currentUser?.id;
+      if (uid == null) return;
+      await Supabase.instance.client
+          .from('sos_dispatches')
+          .update({'status': 'closed'})
+          .eq('id', widget.dispatchId)
+          .eq('assigned_rescuer_id', uid)
+          .inFilter('status', ['dispatching', 'en_route', 'closed']);
+      _closedSynced = true;
+      if (mounted) {
+        setState(() {
+          _routeStatus = 'closed';
+          _statusText = 'Dispatch closed: rescuer arrived at destination.';
+        });
+      }
+    } catch (e) {
+      debugPrint('Failed to mark dispatch closed: $e');
     }
   }
 

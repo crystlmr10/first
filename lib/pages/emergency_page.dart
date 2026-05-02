@@ -1,16 +1,12 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:google_navigation_flutter/google_navigation_flutter.dart' as gnav;
 import 'package:latlong2/latlong.dart' as ll;
-import 'package:image_picker/image_picker.dart';
 import 'package:intl/intl.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:geolocator/geolocator.dart';
-import 'package:http/http.dart' as http;
-import 'package:flutter_typeahead/flutter_typeahead.dart'; // Ensure this is in pubspec.yaml
 
 import 'package:first/pages/widgets/sos_queue_card.dart';
 import 'package:first/utils/sos_dispatch_status.dart';
@@ -35,28 +31,6 @@ class EmergencyPage extends StatefulWidget {
 }
 
 class _EmergencyPageState extends State<EmergencyPage> {
-  static const String _googlePlacesApiKey = String.fromEnvironment(
-    'GOOGLE_PLACES_API_KEY',
-    defaultValue: '',
-  );
-  static const String _googleGeocodingApiKey = String.fromEnvironment(
-    'GOOGLE_GEOCODING_API_KEY',
-    defaultValue: '',
-  );
-  static const bool _allowLegacyGeocodeFallback = bool.fromEnvironment(
-    'ALLOW_LEGACY_GEOCODER_FALLBACK',
-    defaultValue: false,
-  );
-
-  final TextEditingController _descriptionController = TextEditingController();
-  final TextEditingController _locationController = TextEditingController();
-  final ImagePicker _picker = ImagePicker();
-  XFile? _selectedImage;
-  bool _isSubmitting = false;
-  bool _isDetectingLocation = true;
-
-  double? _lat;
-  double? _lng;
 
   /// After closing SOS ACTIVE, show queue card (value is [ticket_number] or "Pending sync").
   String? _sosQueueTicketId;
@@ -201,7 +175,6 @@ class _EmergencyPageState extends State<EmergencyPage> {
     super.initState();
     _sosQueueTicketId = _sessionSosQueueTicketId;
     _bindSosDispatchStream(_sessionSosDispatchId);
-    _initLocationDetection();
     unawaited(_refreshLatestSosDispatchFromDb());
   }
 
@@ -209,209 +182,6 @@ class _EmergencyPageState extends State<EmergencyPage> {
   void dispose() {
     _sosDispatchRowSub?.cancel();
     super.dispose();
-  }
-
-  // --- SEARCH METHOD: Borrowed from HomePage ---
-  Future<List<Map<String, dynamic>>> _getSearchSuggestions(String query) async {
-    if (query.length < 3) return [];
-
-    try {
-      if (_googlePlacesApiKey.isNotEmpty) {
-        final uri = Uri.https(
-          'places.googleapis.com',
-          '/v1/places:autocomplete',
-        );
-        final response = await http.post(
-          uri,
-          headers: {
-            'Content-Type': 'application/json',
-            'X-Goog-Api-Key': _googlePlacesApiKey,
-            'X-Goog-FieldMask':
-                'suggestions.placePrediction.placeId,suggestions.placePrediction.text.text',
-          },
-          body: json.encode({
-            'input': query,
-            'languageCode': 'en',
-            'regionCode': 'PH',
-            'locationBias': {
-              'rectangle': {
-                'low': {'latitude': 10.22, 'longitude': 123.75},
-                'high': {'latitude': 10.45, 'longitude': 124.0},
-              },
-            },
-          }),
-        );
-        if (response.statusCode == 200) {
-          final payload = json.decode(response.body) as Map<String, dynamic>;
-          final suggestions = (payload['suggestions'] as List?) ?? const [];
-          final items = <Map<String, dynamic>>[];
-          for (final raw in suggestions) {
-            final prediction = (raw as Map?)?['placePrediction'];
-            if (prediction is! Map) continue;
-            final placeId = prediction['placeId']?.toString();
-            final displayName = (prediction['text'] as Map?)?['text']
-                ?.toString();
-            if (placeId == null || placeId.isEmpty || displayName == null) {
-              continue;
-            }
-            items.add({'display_name': displayName, 'place_id': placeId});
-          }
-          if (items.isNotEmpty) return items;
-        }
-      }
-
-      if (!_allowLegacyGeocodeFallback) {
-        return [];
-      }
-
-      final url =
-          'https://nominatim.openstreetmap.org/search'
-          '?q=$query&format=json&limit=5&addressdetails=1'
-          '&countrycodes=ph&viewbox=123.75,10.45,124.0,10.22&bounded=1';
-      final response = await http.get(
-        Uri.parse(url),
-        headers: {'User-Agent': 'Floote_App_Emergency'},
-      );
-      if (response.statusCode == 200) {
-        final List data = json.decode(response.body);
-        return data
-            .where((item) {
-              final address = item['display_name'].toString().toLowerCase();
-              return address.contains('cebu');
-            })
-            .toList()
-            .cast<Map<String, dynamic>>();
-      }
-    } catch (e) {
-      debugPrint("Search Error: $e");
-    }
-    return [];
-  }
-
-  // --- AUTO-DETECT ADDRESS FROM GPS ---
-  Future<void> _initLocationDetection() async {
-    setState(() => _isDetectingLocation = true);
-    try {
-      Position position = await Geolocator.getCurrentPosition(
-        locationSettings: const LocationSettings(
-          accuracy: LocationAccuracy.high,
-        ),
-      );
-
-      _lat = position.latitude;
-      _lng = position.longitude;
-
-      if (_googleGeocodingApiKey.isNotEmpty || _googlePlacesApiKey.isNotEmpty) {
-        final geocodeKey = _googleGeocodingApiKey.isNotEmpty
-            ? _googleGeocodingApiKey
-            : _googlePlacesApiKey;
-        final uri = Uri.https('maps.googleapis.com', '/maps/api/geocode/json', {
-          'latlng': '$_lat,$_lng',
-          'key': geocodeKey,
-        });
-        final response = await http.get(uri);
-        if (response.statusCode == 200) {
-          final data = json.decode(response.body);
-          final results = data['results'];
-          if (results is List && results.isNotEmpty) {
-            setState(() {
-              _locationController.text =
-                  results.first['formatted_address'] ?? "Current Location";
-              _isDetectingLocation = false;
-            });
-            return;
-          }
-        }
-      }
-
-      if (_allowLegacyGeocodeFallback) {
-        final url = Uri.parse(
-          'https://nominatim.openstreetmap.org/reverse?format=json&lat=$_lat&lon=$_lng&zoom=18',
-        );
-
-        final response = await http.get(
-          url,
-          headers: {'User-Agent': 'Floote_App'},
-        );
-
-        if (response.statusCode == 200) {
-          final data = json.decode(response.body);
-          setState(() {
-            _locationController.text =
-                data['display_name'] ?? "Current Location";
-            _isDetectingLocation = false;
-          });
-          return;
-        }
-      }
-
-      setState(() {
-        _locationController.text = "Current Location";
-        _isDetectingLocation = false;
-      });
-    } catch (e) {
-      debugPrint("Address detection error: $e");
-      setState(() {
-        _locationController.text = "";
-        _isDetectingLocation = false;
-      });
-    }
-  }
-
-  Future<void> _pickImage() async {
-    final XFile? image = await _picker.pickImage(source: ImageSource.gallery);
-    if (image != null) setState(() => _selectedImage = image);
-  }
-
-  Future<void> _submitReport() async {
-    if (_descriptionController.text.trim().isEmpty ||
-        _locationController.text.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Description and Location are required.")),
-      );
-      return;
-    }
-
-    setState(() => _isSubmitting = true);
-
-    try {
-      String? publicUrl;
-
-      if (_selectedImage != null) {
-        final file = File(_selectedImage!.path);
-        final fileName = 'report_${DateTime.now().millisecondsSinceEpoch}.jpg';
-        await Supabase.instance.client.storage
-            .from('reports')
-            .upload(fileName, file);
-        publicUrl = Supabase.instance.client.storage
-            .from('reports')
-            .getPublicUrl(fileName);
-      }
-
-      await Supabase.instance.client.from('user_reports').insert({
-        'location_name': _locationController.text.trim(),
-        'user_comments': _descriptionController.text.trim(),
-        'image_url': publicUrl,
-        'latitude': _lat,
-        'longitude': _lng,
-        'created_at': DateTime.now().toIso8601String(),
-        'admin_decision': 'Pending',
-      });
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text("Report submitted!"),
-            backgroundColor: Colors.green,
-          ),
-        );
-        Navigator.pop(context);
-      }
-    } catch (e) {
-      debugPrint("Submit Error: $e");
-    } finally {
-      if (mounted) setState(() => _isSubmitting = false);
-    }
   }
 
   @override
@@ -437,7 +207,7 @@ class _EmergencyPageState extends State<EmergencyPage> {
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             _buildEmergencyContactsSection(),
-            // Order: (1) Contacts → (3) queue if active → (2) history → (4) Report.
+            // Order: (1) Contacts → (2) queue if active → (3) history.
             if (_showSosQueueCard) ...[
               const SizedBox(height: 16),
               SosQueueCard(
@@ -446,8 +216,7 @@ class _EmergencyPageState extends State<EmergencyPage> {
                 ),
                 ticketNumber: _sosQueueTicketId!,
                 dispatchId: _sessionSosDispatchId,
-                initialStatus:
-                    _sessionSosStatus ?? SosDispatchStatuses.submitted,
+                initialStatus: _sessionSosStatus ?? SosDispatchStatuses.submitted,
                 onTap: _openSosDetailFromQueue,
               ),
             ],
@@ -455,147 +224,6 @@ class _EmergencyPageState extends State<EmergencyPage> {
               const SizedBox(height: 16),
               _buildSosHistorySection(),
             ],
-            const SizedBox(height: 30),
-            const Text(
-              "Report Incident",
-              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 16),
-
-            // --- EDITABLE SEARCHABLE LOCATION FIELD ---
-            const Text(
-              "Location *",
-              style: TextStyle(fontWeight: FontWeight.w500),
-            ),
-            const SizedBox(height: 8),
-            TypeAheadField<Map<String, dynamic>>(
-              builder: (context, controller, focusNode) => TextField(
-                controller: controller,
-                focusNode: focusNode,
-                decoration: InputDecoration(
-                  prefixIcon: const Icon(Icons.location_on, color: Colors.red),
-                  suffixIcon: _isDetectingLocation
-                      ? const Padding(
-                          padding: EdgeInsets.all(12),
-                          child: SizedBox(
-                            width: 20,
-                            height: 20,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          ),
-                        )
-                      : IconButton(
-                          icon: const Icon(Icons.my_location),
-                          onPressed: _initLocationDetection,
-                        ),
-                  hintText: "Type street name or use GPS...",
-                  border: OutlineInputBorder(
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                  filled: true,
-                  fillColor: Colors.green.shade50,
-                ),
-              ),
-              suggestionsCallback: (pattern) async =>
-                  await _getSearchSuggestions(pattern),
-              itemBuilder: (context, suggestion) => ListTile(
-                leading: const Icon(Icons.map, size: 20),
-                title: Text(
-                  suggestion['display_name'],
-                  style: const TextStyle(fontSize: 12),
-                ),
-              ),
-              onSelected: (suggestion) {
-                _resolveAndSetSelectedLocation(suggestion);
-              },
-              controller: _locationController,
-            ),
-
-            const SizedBox(height: 20),
-            const Text(
-              "Description *",
-              style: TextStyle(fontWeight: FontWeight.w500),
-            ),
-            const SizedBox(height: 8),
-            TextField(
-              controller: _descriptionController,
-              maxLines: 3,
-              decoration: InputDecoration(
-                hintText: "Describe the water level or blockage...",
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                ),
-              ),
-            ),
-
-            const SizedBox(height: 20),
-            const Text(
-              "Incident Photo",
-              style: TextStyle(fontWeight: FontWeight.w500),
-            ),
-            const SizedBox(height: 8),
-            GestureDetector(
-              onTap: _pickImage,
-              child: Container(
-                width: double.infinity,
-                padding: const EdgeInsets.symmetric(vertical: 30),
-                decoration: BoxDecoration(
-                  border: Border.all(color: Colors.blue.shade200),
-                  borderRadius: BorderRadius.circular(10),
-                  color: Colors.blue.shade50.withValues(alpha: 0.3),
-                ),
-                child: _selectedImage == null
-                    ? const Column(
-                        children: [
-                          Icon(Icons.camera_alt, color: Colors.blue),
-                          Text(
-                            "Tap to take/upload photo",
-                            style: TextStyle(
-                              color: Colors.blue,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                        ],
-                      )
-                    : Column(
-                        children: [
-                          const Icon(Icons.check_circle, color: Colors.green),
-                          Text(
-                            _selectedImage!.name,
-                            style: const TextStyle(fontSize: 12),
-                          ),
-                        ],
-                      ),
-              ),
-            ),
-
-            const SizedBox(height: 30),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.blue.shade700,
-                  foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(vertical: 15),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(10),
-                  ),
-                ),
-                onPressed: _isSubmitting ? null : _submitReport,
-                child: _isSubmitting
-                    ? const SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(
-                          color: Colors.white,
-                          strokeWidth: 2,
-                        ),
-                      )
-                    : const Text(
-                        "SUBMIT REPORT",
-                        style: TextStyle(fontWeight: FontWeight.bold),
-                      ),
-              ),
-            ),
           ],
         ),
       ),
@@ -850,58 +478,6 @@ class _EmergencyPageState extends State<EmergencyPage> {
     );
   }
 
-  Future<void> _resolveAndSetSelectedLocation(
-    Map<String, dynamic> suggestion,
-  ) async {
-    final rawLat = suggestion['lat']?.toString();
-    final rawLng = suggestion['lon']?.toString();
-    if (rawLat != null && rawLng != null) {
-      final parsedLat = double.tryParse(rawLat);
-      final parsedLng = double.tryParse(rawLng);
-      if (parsedLat != null && parsedLng != null) {
-        setState(() {
-          _locationController.text = suggestion['display_name'];
-          _lat = parsedLat;
-          _lng = parsedLng;
-        });
-        return;
-      }
-    }
-
-    final placeId = suggestion['place_id']?.toString();
-    if (placeId == null || placeId.isEmpty || _googlePlacesApiKey.isEmpty) {
-      return;
-    }
-
-    try {
-      final encodedPlaceId = Uri.encodeComponent(placeId);
-      final uri = Uri.https(
-        'places.googleapis.com',
-        '/v1/places/$encodedPlaceId',
-      );
-      final response = await http.get(
-        uri,
-        headers: {
-          'X-Goog-Api-Key': _googlePlacesApiKey,
-          'X-Goog-FieldMask': 'location',
-        },
-      );
-      if (response.statusCode != 200) return;
-      final body = json.decode(response.body) as Map<String, dynamic>;
-      final location = body['location'];
-      if (location is! Map) return;
-      final lat = (location['latitude'] as num?)?.toDouble();
-      final lng = (location['longitude'] as num?)?.toDouble();
-      if (lat == null || lng == null) return;
-      setState(() {
-        _locationController.text = suggestion['display_name'];
-        _lat = lat;
-        _lng = lng;
-      });
-    } catch (e) {
-      debugPrint('Place resolve error: $e');
-    }
-  }
 }
 
 /// 3-second SOS activation UI (Cebu City Emergency). Then [onCountdownComplete] opens [_SosBroadcastPage].
@@ -1084,14 +660,15 @@ class _SosActivatingSheetState extends State<_SosActivatingSheet>
                   const SizedBox(height: 20),
                   TextButton(
                     onPressed: _cancel,
-                    child: Text(
+                    style: TextButton.styleFrom(
+                      foregroundColor: accent,
+                    ),
+                    child: const Text(
                       'TAP TO CANCEL',
                       style: TextStyle(
-                        color: accent,
                         fontWeight: FontWeight.w800,
                         letterSpacing: 0.8,
                         decoration: TextDecoration.underline,
-                        decorationColor: accent,
                       ),
                     ),
                   ),

@@ -12,10 +12,21 @@ final GlobalKey<ScaffoldMessengerState> scaffoldMessengerKey =
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // 3. Initialize Supabase
+  const supabaseUrl = String.fromEnvironment('SUPABASE_URL', defaultValue: '');
+  const supabaseAnonKey =
+      String.fromEnvironment('SUPABASE_ANON_KEY', defaultValue: '');
+  if (supabaseUrl.isEmpty || supabaseAnonKey.isEmpty) {
+    throw StateError(
+      'Set SUPABASE_URL and SUPABASE_ANON_KEY (e.g. '
+      '--dart-define-from-file=secrets.json or '
+      '--dart-define=SUPABASE_URL=... --dart-define=SUPABASE_ANON_KEY=...). '
+      'See README "Secrets & local setup".',
+    );
+  }
+
   await Supabase.initialize(
-    url: 'https://ttsrktldvvqrgkfhsbbl.supabase.co/',
-    anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InR0c3JrdGxkdnZxcmdrZmhzYmJsIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzI1NDYxODcsImV4cCI6MjA4ODEyMjE4N30.DkQAOtyA4gezkPFCWPtyoS2UKw2NYvZcAlsAWbql3QY',
+    url: supabaseUrl,
+    anonKey: supabaseAnonKey,
   );
 
   await FcmService.instance.initAfterSupabase();

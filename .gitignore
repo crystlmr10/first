@@ -45,3 +45,13 @@ app.*.map.json
 /android/app/release
 
 .env
+secrets.json
+
+# Local Firebase / Maps (copy from .example files; never commit real keys)
+android/app/google-services.json
+
+# Accidental CLI artifacts
+.gradle-user-home/
+/Get
+/Process
+/Run
