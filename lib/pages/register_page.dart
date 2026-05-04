@@ -1,5 +1,6 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:postgrest/postgrest.dart' show PostgrestException;
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../utils/auth_login.dart';
 import '../utils/philippine_phone.dart';
@@ -51,7 +52,8 @@ class _RegisterPageState extends State<RegisterPage>
     // Basic Validation
     if (_usernameController.text.isEmpty ||
         _emailController.text.isEmpty ||
-        _passwordController.text.isEmpty) {
+        _passwordController.text.isEmpty ||
+        _phoneController.text.trim().isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Please fill in all required fields')),
       );
@@ -63,7 +65,7 @@ class _RegisterPageState extends State<RegisterPage>
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
-            content: Text(kRegistrationFailed),
+            content: Text(kInvalidPhilippineMobile),
             backgroundColor: Colors.redAccent,
           ),
         );
@@ -82,7 +84,7 @@ class _RegisterPageState extends State<RegisterPage>
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text(kRegistrationFailed),
+              content: Text(kRegistrationEmailInvalid),
               backgroundColor: Colors.redAccent,
             ),
           );
@@ -130,24 +132,19 @@ class _RegisterPageState extends State<RegisterPage>
           profileRow,
           onConflict: 'id',
         );
-      } catch (e, st) {
+      } on PostgrestException catch (e, st) {
         if (kDebugMode) {
           debugPrint('profiles upsert failed: $e\n$st');
         }
-        // Auth user may already exist; profile write often fails under RLS until
-        // email is confirmed or a DB trigger fills profiles. Clear partial session.
         if (res.session != null) {
           await supabase.auth.signOut();
         }
         if (!mounted) return;
         ScaffoldMessenger.of(context).clearSnackBars();
-        Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(
-            builder: (context) => const LoginPage(
-              initialBannerText: kRegistrationCreatedUseSignIn,
-              initialBannerSuccess: true,
-            ),
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(registrationProfileErrorMessage(e)),
+            backgroundColor: Colors.redAccent,
           ),
         );
         return;
@@ -170,14 +167,16 @@ class _RegisterPageState extends State<RegisterPage>
                 ),
         ),
       );
-    } on AuthException catch (_) {
+    } on AuthException catch (e) {
       if (kDebugMode) {
-        debugPrint('Register AuthException (details omitted; use Supabase logs).');
+        debugPrint(
+          'Register AuthException: ${e.message} code=${e.code} status=${e.statusCode}',
+        );
       }
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(kRegistrationFailed),
+          SnackBar(
+            content: Text(registrationAuthErrorMessage(e)),
             backgroundColor: Colors.redAccent,
           ),
         );

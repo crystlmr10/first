@@ -49,6 +49,7 @@ secrets.json
 
 # Local Firebase / Maps (copy from .example files; never commit real keys)
 android/app/google-services.json
+android/app/src/main/res/values/google_maps_api.xml
 
 # Accidental CLI artifacts
 .gradle-user-home/

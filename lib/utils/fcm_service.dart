@@ -74,6 +74,24 @@ class FcmService {
     } catch (_) {}
   }
 
+  /// Removes only this install's row from [device_tokens] (call while still signed in).
+  Future<void> removeCurrentDeviceTokenFromSupabase() async {
+    if (!_initialized) return;
+    final uid = Supabase.instance.client.auth.currentUser?.id;
+    if (uid == null) return;
+    try {
+      final token = await FirebaseMessaging.instance.getToken();
+      if (token == null || token.isEmpty) return;
+      await Supabase.instance.client
+          .from('device_tokens')
+          .delete()
+          .eq('user_id', uid)
+          .eq('fcm_token', token);
+    } catch (e) {
+      debugPrint('device_tokens delete (this device): $e');
+    }
+  }
+
   Future<void> _refreshAndStoreToken() async {
     final uid = Supabase.instance.client.auth.currentUser?.id;
     if (uid == null) return;

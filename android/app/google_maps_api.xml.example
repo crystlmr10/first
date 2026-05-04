@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Replace YOUR_GOOGLE_MAPS_ANDROID_KEY with your Maps SDK key (restrict by package + SHA1). -->
+<!-- Copy to src/main/res/values/google_maps_api.xml and set your Maps SDK key. -->
 <resources>
     <string name="google_maps_api_key">YOUR_GOOGLE_MAPS_ANDROID_KEY</string>
 </resources>

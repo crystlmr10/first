@@ -11,7 +11,6 @@ import 'package:geolocator/geolocator.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:flutter_typeahead/flutter_typeahead.dart';
-import 'package:first/utils/sensor_reading_format.dart';
 import 'package:first/services/flood_route_service.dart';
 
 import 'emergency_page.dart';
@@ -1113,7 +1112,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
                 _buildTopSearchBar(),
                 _buildStatusStrip(),
-                _buildWaterLevelStrip(),
                 _buildSOSButton(),
                 _buildFollowToggle(),
                 _buildZoomControls(),
@@ -1271,108 +1269,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         ),
       ),
     );
-  }
-
-  Widget _buildWaterLevelStrip() {
-    return StreamBuilder<List<Map<String, dynamic>>>(
-      stream: Supabase.instance.client
-          .from('user_reports')
-          .stream(primaryKey: ['id']),
-      builder: (context, snapshot) {
-        final reports = snapshot.data ?? const <Map<String, dynamic>>[];
-        final bestReport = _pickWaterLevelReport(reports);
-        if (bestReport == null) {
-          return const SizedBox.shrink();
-        }
-
-        final waterLevelCm = _readWaterLevelCm(bestReport);
-        final decision = (bestReport['admin_decision'] ?? '').toString();
-        final location = (bestReport['location_name'] ?? 'Nearby area')
-            .toString();
-
-        final Color levelColor = waterLevelCm >= 80
-            ? _dangerColor
-            : (waterLevelCm >= 40 ? Colors.orangeAccent : _accentColor);
-
-        return Positioned(
-          top: MediaQuery.of(context).padding.top + 130,
-          left: 16,
-          right: 16,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
-            decoration: BoxDecoration(
-              color: _panelColor.withAlpha(200),
-              borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: Colors.white24),
-              boxShadow: const [
-                BoxShadow(
-                  color: Colors.black38,
-                  blurRadius: 18,
-                  offset: Offset(0, 8),
-                ),
-              ],
-            ),
-            child: Row(
-              children: [
-                Icon(Icons.water_drop, color: levelColor, size: 20),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'Water Level: ${formatSensorReading(waterLevelCm)} cm',
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 13,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        '$location • $decision',
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                          color: Colors.blueGrey.shade100,
-                          fontSize: 11,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  Map<String, dynamic>? _pickWaterLevelReport(
-    List<Map<String, dynamic>> reports,
-  ) {
-    if (reports.isEmpty) return null;
-
-    final withLevels = reports.where((r) => _readWaterLevelCm(r) > 0).toList();
-    if (withLevels.isNotEmpty) {
-      withLevels.sort(
-        (a, b) => _readWaterLevelCm(b).compareTo(_readWaterLevelCm(a)),
-      );
-      return withLevels.first;
-    }
-
-    final impassable = reports.firstWhere(
-      (r) =>
-          (r['admin_decision'] ?? '').toString().trim().toLowerCase() ==
-          'impassable',
-      orElse: () => reports.first,
-    );
-    return impassable;
-  }
-
-  double _readWaterLevelCm(Map<String, dynamic> report) {
-    return _HomePageHazardWidgets.readWaterLevelCm(report);
   }
 
   void _showReportDetails(Map<String, dynamic> report) {

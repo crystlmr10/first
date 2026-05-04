@@ -4,7 +4,12 @@ import 'package:flutter/material.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+import '../app_navigator.dart';
+import '../utils/auth_login.dart';
+import '../utils/fcm_service.dart';
 import '../utils/philippine_phone.dart';
+import 'login_page.dart';
+import 'rescuer_login_page.dart';
 
 /// Profile screen: loads/saves [public.profiles] (see `supabase/sql/profiles_table.sql`).
 class ProfilePage extends StatefulWidget {
@@ -195,9 +200,9 @@ class _ProfilePageState extends State<ProfilePage> {
       if (phoneNormalized == null) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
+            SnackBar(
               content: Text(
-                'Enter a valid PH mobile number, or clear the field.',
+                '$kInvalidPhilippineMobile Or clear the field.',
               ),
               backgroundColor: Colors.redAccent,
             ),
@@ -278,7 +283,41 @@ class _ProfilePageState extends State<ProfilePage> {
       ),
     );
     if (ok != true || !mounted) return;
-    await Supabase.instance.client.auth.signOut();
+
+    final client = Supabase.instance.client;
+    final user = client.auth.currentUser;
+    if (user == null) {
+      _navigateToLoginAfterLogout();
+      return;
+    }
+
+    try {
+      await FcmService.instance.removeCurrentDeviceTokenFromSupabase();
+
+      await client.auth.signOut(scope: SignOutScope.local);
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not sign out: $e')),
+        );
+      }
+      return;
+    }
+
+    if (!mounted) return;
+    _navigateToLoginAfterLogout();
+  }
+
+  void _navigateToLoginAfterLogout() {
+    final route = MaterialPageRoute<void>(
+      builder: (_) => widget.isRescuerAccount
+          ? const RescuerLoginPage()
+          : const LoginPage(),
+    );
+    rootNavigatorKey.currentState?.pushAndRemoveUntil(
+      route,
+      (route) => false,
+    );
   }
 
   /// Nested [Scaffold] inside [HomePage]'s body can get zero height / show the

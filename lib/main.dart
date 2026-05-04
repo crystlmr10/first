@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:first/app_navigator.dart';
 import 'package:first/utils/fcm_service.dart';
 import 'pages/login_page.dart';
 import 'pages/rescuer_login_page.dart';
@@ -47,6 +48,7 @@ class FlooteApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
+      navigatorKey: rootNavigatorKey,
       // 4. Apply the Messenger Key
       scaffoldMessengerKey: scaffoldMessengerKey,
       debugShowCheckedModeBanner: false,
