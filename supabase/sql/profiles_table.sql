@@ -17,6 +17,15 @@ create table if not exists public.profiles (
 create index if not exists profiles_email_lower_idx
   on public.profiles (lower(email));
 
+-- Enforce unique username and phone number when provided.
+create unique index if not exists profiles_username_lower_uidx
+  on public.profiles (lower(username))
+  where username is not null and length(trim(username)) > 0;
+
+create unique index if not exists profiles_phone_number_uidx
+  on public.profiles (phone_number)
+  where phone_number is not null and length(trim(phone_number)) > 0;
+
 comment on table public.profiles is
   'Floote profile: display name, phone, role. Filled by trigger and/or the mobile app.';
 

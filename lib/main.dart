@@ -4,11 +4,92 @@ import 'package:supabase_flutter/supabase_flutter.dart';
 import 'package:first/app_navigator.dart';
 import 'package:first/utils/fcm_service.dart';
 import 'pages/login_page.dart';
+import 'pages/password_recovery_page.dart';
 import 'pages/rescuer_login_page.dart';
+import 'pages/rescuer_home_page.dart';
+import 'pages/user_home_page.dart';
 
 // --- GLOBAL KEY FOR ALERTS ---
 final GlobalKey<ScaffoldMessengerState> scaffoldMessengerKey =
     GlobalKey<ScaffoldMessengerState>();
+bool _passwordRecoveryOpen = false;
+bool _emailVerificationHandling = false;
+String? _lastHandledVerificationAccessToken;
+
+bool _isSignupVerificationCallbackSession(Session session) {
+  try {
+    final claims = decodeJwt(session.accessToken).payload.claims;
+    final type = (claims['type'] ?? '').toString().toLowerCase();
+    if (type == 'signup') return true;
+
+    final amr = claims['amr'];
+    if (amr is List) {
+      for (final entry in amr) {
+        if (entry is Map &&
+            (entry['method'] ?? '').toString().toLowerCase() == 'otp') {
+          return true;
+        }
+      }
+    }
+  } catch (_) {
+    return false;
+  }
+  return false;
+}
+
+Future<void> _handleSignupVerificationCallback(Session session) async {
+  final token = session.accessToken;
+  if (_emailVerificationHandling || _lastHandledVerificationAccessToken == token) {
+    return;
+  }
+  _emailVerificationHandling = true;
+  _lastHandledVerificationAccessToken = token;
+
+  try {
+    await Supabase.instance.client.auth.signOut();
+  } catch (_) {
+    // Best-effort sign out; continue with user-facing feedback.
+  }
+
+  WidgetsBinding.instance.addPostFrameCallback((_) {
+    final messenger = scaffoldMessengerKey.currentState;
+    messenger?.clearSnackBars();
+    messenger?.showSnackBar(
+      const SnackBar(
+        content: Text('Email verified successfully. You can now sign in.'),
+        backgroundColor: Colors.green,
+      ),
+    );
+
+    final navigator = rootNavigatorKey.currentState;
+    if (navigator != null) {
+      navigator.pushAndRemoveUntil(
+        MaterialPageRoute(
+          builder: (_) => const LoginPage(
+            initialBannerText: 'Email verified successfully. Please sign in.',
+            initialBannerSuccess: true,
+          ),
+        ),
+        (route) => false,
+      );
+    }
+  });
+
+  _emailVerificationHandling = false;
+}
+
+void _openPasswordRecoveryFlow() {
+  final navigator = rootNavigatorKey.currentState;
+  if (navigator == null || _passwordRecoveryOpen) return;
+  _passwordRecoveryOpen = true;
+  navigator
+      .push(
+        MaterialPageRoute(builder: (_) => const PasswordRecoveryPage()),
+      )
+      .whenComplete(() {
+        _passwordRecoveryOpen = false;
+      });
+}
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -32,6 +113,18 @@ Future<void> main() async {
 
   await FcmService.instance.initAfterSupabase();
   Supabase.instance.client.auth.onAuthStateChange.listen((data) {
+    if (data.event == AuthChangeEvent.signedIn && data.session != null) {
+      final session = data.session!;
+      if (_isSignupVerificationCallbackSession(session)) {
+        unawaited(_handleSignupVerificationCallback(session));
+        return;
+      }
+    }
+    if (data.event == AuthChangeEvent.passwordRecovery) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _openPasswordRecoveryFlow();
+      });
+    }
     if (data.session != null) {
       unawaited(FcmService.instance.onAuthSessionReady());
     } else {
@@ -57,7 +150,74 @@ class FlooteApp extends StatelessWidget {
         useMaterial3: true,
         primarySwatch: Colors.blue,
       ),
-      home: const FlooteOnboarding(),
+      home: const _AppEntryGate(),
+    );
+  }
+}
+
+class _AppEntryGate extends StatefulWidget {
+  const _AppEntryGate();
+
+  @override
+  State<_AppEntryGate> createState() => _AppEntryGateState();
+}
+
+class _AppEntryGateState extends State<_AppEntryGate> {
+  late Session? _session;
+  StreamSubscription<AuthState>? _authSub;
+
+  @override
+  void initState() {
+    super.initState();
+    _session = Supabase.instance.client.auth.currentSession;
+    _authSub = Supabase.instance.client.auth.onAuthStateChange.listen((data) {
+      if (!mounted) return;
+      setState(() => _session = data.session);
+    });
+  }
+
+  @override
+  void dispose() {
+    _authSub?.cancel();
+    super.dispose();
+  }
+
+  Future<Widget> _resolveSignedInHome() async {
+    final userId = _session?.user.id;
+    if (userId == null) return const FlooteOnboarding();
+    try {
+      final row = await Supabase.instance.client
+          .from('profiles')
+          .select('role')
+          .eq('id', userId)
+          .maybeSingle();
+      final role = (row?['role'] ?? '').toString().trim().toLowerCase();
+      if (role == 'rescuer' || role == 'admin') {
+        return const RescuerHomePage();
+      }
+      return const UserHomePage();
+    } catch (_) {
+      // If profile fetch fails transiently, preserve signed-in UX by defaulting to user home.
+      return const UserHomePage();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_session == null) {
+      return const FlooteOnboarding();
+    }
+    return FutureBuilder<Widget>(
+      key: ValueKey<String>(_session!.user.id),
+      future: _resolveSignedInHome(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) {
+          return const Scaffold(
+            body: Center(child: CircularProgressIndicator()),
+          );
+        }
+        return snapshot.data ?? const FlooteOnboarding();
+      },
     );
   }
 }

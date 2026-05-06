@@ -11,11 +11,19 @@ class LoginPage extends StatefulWidget {
     super.key,
     this.initialBannerText,
     this.initialBannerSuccess = false,
+    this.showEmailVerificationRequired = false,
+    this.registeredEmailForResend,
   });
 
   /// Shown once after navigation (e.g. from registration) so the correct screen owns the snackbar.
   final String? initialBannerText;
   final bool initialBannerSuccess;
+
+  /// Shows the “verify email before sign-in” panel (e.g. after sign-up with confirm-email enabled).
+  final bool showEmailVerificationRequired;
+
+  /// Used only for resend and masked display; never shown in full.
+  final String? registeredEmailForResend;
 
   @override
   State<LoginPage> createState() => _LoginPageState();
@@ -24,13 +32,23 @@ class LoginPage extends StatefulWidget {
 class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
   final _identifierController = TextEditingController();
   final _passwordController = TextEditingController();
+  bool _obscurePassword = true;
   bool _isLoading = false;
+  late bool _showVerificationPanel;
+  String? _emailForResend;
+  Timer? _resendCooldownTimer;
+  int _resendCooldownSeconds = 0;
+  bool _resendInFlight = false;
   late final AnimationController _bgController;
   late final AnimationController _entryController;
 
   @override
   void initState() {
     super.initState();
+    _showVerificationPanel = widget.showEmailVerificationRequired;
+    final raw = widget.registeredEmailForResend?.trim();
+    _emailForResend =
+        (raw == null || raw.isEmpty) ? null : normalizeAuthIdentifier(raw);
     _bgController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 3200),
@@ -59,11 +77,190 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
 
   @override
   void dispose() {
+    _resendCooldownTimer?.cancel();
     _identifierController.dispose();
     _passwordController.dispose();
     _bgController.dispose();
     _entryController.dispose();
     super.dispose();
+  }
+
+  void _startResendCooldown(int seconds) {
+    _resendCooldownTimer?.cancel();
+    setState(() => _resendCooldownSeconds = seconds);
+    _resendCooldownTimer = Timer.periodic(const Duration(seconds: 1), (t) {
+      if (!mounted) {
+        t.cancel();
+        return;
+      }
+      if (_resendCooldownSeconds <= 1) {
+        t.cancel();
+        setState(() => _resendCooldownSeconds = 0);
+      } else {
+        setState(() => _resendCooldownSeconds--);
+      }
+    });
+  }
+
+  Future<void> _resendVerificationEmail() async {
+    var email = _emailForResend;
+    if (email == null || email.isEmpty) {
+      final id = normalizeAuthIdentifier(_identifierController.text);
+      if (id.contains('@')) {
+        email = id;
+      }
+    }
+    if (email == null || !email.contains('@')) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Enter the email you registered with above, then tap Resend.',
+          ),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+      return;
+    }
+    if (_resendCooldownSeconds > 0 || _resendInFlight) return;
+
+    setState(() => _resendInFlight = true);
+    try {
+      await Supabase.instance.client.auth
+          .resend(
+            type: OtpType.signup,
+            email: email,
+            emailRedirectTo: emailConfirmRedirectUrl(),
+          )
+          .timeout(const Duration(seconds: 15));
+      if (!mounted) return;
+      _emailForResend ??= email;
+      _startResendCooldown(60);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Verification email sent. Check your inbox.'),
+          backgroundColor: Colors.green,
+        ),
+      );
+    } on AuthException catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            e.message.isNotEmpty ? e.message : 'Could not resend email.',
+          ),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+    } on TimeoutException {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Request timed out. Check your connection.'),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+    } finally {
+      if (mounted) setState(() => _resendInFlight = false);
+    }
+  }
+
+  Widget _buildEmailVerificationPanel() {
+    final hint = _emailForResend;
+    final detail = hint != null && hint.contains('@')
+        ? 'We sent a secure link to ${maskEmailForDisplay(hint)}. Open it to verify your account, then sign in below.'
+        : 'We sent a verification link to your email. Check your inbox and spam folder, then sign in below.';
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white.withAlpha(242),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.amber.shade700.withAlpha(180)),
+        boxShadow: const [
+          BoxShadow(
+            color: Colors.black26,
+            blurRadius: 12,
+            offset: Offset(0, 4),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Icon(
+                Icons.mark_email_unread_outlined,
+                color: Colors.amber.shade800,
+                size: 28,
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      kEmailVerificationPanelTitle,
+                      style: TextStyle(
+                        fontWeight: FontWeight.w800,
+                        fontSize: 17,
+                        color: Color(0xFF12305E),
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      detail,
+                      style: const TextStyle(
+                        fontSize: 14,
+                        height: 1.35,
+                        color: Color(0xFF334866),
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    const Text(
+                      'For your security, you must verify your email before you can log in.',
+                      style: TextStyle(
+                        fontSize: 13,
+                        height: 1.35,
+                        color: Colors.black54,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          Align(
+            alignment: Alignment.centerRight,
+            child: TextButton(
+              onPressed: (_resendCooldownSeconds > 0 || _resendInFlight)
+                  ? null
+                  : _resendVerificationEmail,
+              child: _resendInFlight
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : Text(
+                      _resendCooldownSeconds > 0
+                          ? 'Resend verification email (${_resendCooldownSeconds}s)'
+                          : 'Resend verification email',
+                      style: const TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 15,
+                      ),
+                    ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   Future<void> _handleLogin() async {
@@ -77,6 +274,8 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
     }
 
     setState(() => _isLoading = true);
+
+    String? resolvedEmailForAuth;
 
     try {
       final client = Supabase.instance.client;
@@ -117,6 +316,7 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
       }
 
       final emailForAuth = normalizeAuthIdentifier(resolvedEmail);
+      resolvedEmailForAuth = emailForAuth;
 
       final auth = await client.auth.signInWithPassword(
         email: emailForAuth,
@@ -171,11 +371,20 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
           ),
         );
       }
-    } on AuthException catch (_) {
+    } on AuthException catch (e) {
       if (mounted) {
+        if (authExceptionIsEmailNotConfirmed(e)) {
+          setState(() {
+            _showVerificationPanel = true;
+            final addr = resolvedEmailForAuth;
+            if (addr != null && addr.contains('@')) {
+              _emailForResend = addr;
+            }
+          });
+        }
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text(kInvalidLoginCredentials),
+          SnackBar(
+            content: Text(loginAuthErrorMessage(e)),
             backgroundColor: Colors.redAccent,
           ),
         );
@@ -278,6 +487,10 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
                         style: TextStyle(fontSize: 15, color: Colors.white70),
                       ),
                       const SizedBox(height: 24),
+                      if (_showVerificationPanel) ...[
+                        _buildEmailVerificationPanel(),
+                        const SizedBox(height: 16),
+                      ],
                       Container(
                         padding: const EdgeInsets.all(16),
                         decoration: BoxDecoration(
@@ -337,6 +550,10 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
                               hint: '••••••••',
                               isPassword: true,
                               controller: _passwordController,
+                              passwordObscured: _obscurePassword,
+                              onTogglePasswordVisibility: () => setState(
+                                () => _obscurePassword = !_obscurePassword,
+                              ),
                             ),
                             const SizedBox(height: 24),
                             SizedBox(
@@ -430,7 +647,13 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
     required String hint,
     required TextEditingController controller,
     bool isPassword = false,
+    bool? passwordObscured,
+    VoidCallback? onTogglePasswordVisibility,
   }) {
+    final showPasswordToggle =
+        isPassword && onTogglePasswordVisibility != null;
+    final effectiveObscure = isPassword ? (passwordObscured ?? true) : false;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -445,7 +668,9 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
         const SizedBox(height: 8),
         TextField(
           controller: controller,
-          obscureText: isPassword,
+          obscureText: effectiveObscure,
+          keyboardType:
+              isPassword ? TextInputType.visiblePassword : TextInputType.text,
           decoration: InputDecoration(
             hintText: hint,
             hintStyle: TextStyle(color: Colors.grey[400]),
@@ -459,6 +684,18 @@ class _LoginPageState extends State<LoginPage> with TickerProviderStateMixin {
               horizontal: 16,
               vertical: 16,
             ),
+            suffixIcon: showPasswordToggle
+                ? IconButton(
+                    tooltip: effectiveObscure ? 'Show password' : 'Hide password',
+                    onPressed: onTogglePasswordVisibility,
+                    icon: Icon(
+                      effectiveObscure
+                          ? Icons.visibility_outlined
+                          : Icons.visibility_off_outlined,
+                      color: const Color(0xFF12305E),
+                    ),
+                  )
+                : null,
           ),
         ),
       ],

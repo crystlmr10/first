@@ -1,11 +1,15 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:postgrest/postgrest.dart' show PostgrestException;
 import 'package:supabase_flutter/supabase_flutter.dart';
 import '../utils/auth_login.dart';
+import '../utils/password_policy.dart';
+import '../utils/philippine_mobile_input_formatter.dart';
 import '../utils/philippine_phone.dart';
 import 'login_page.dart';
-import 'location_permission_page.dart';
+import '../widgets/password_confirm_match_panel.dart';
+import '../widgets/password_requirements_panel.dart';
 
 class RegisterPage extends StatefulWidget {
   const RegisterPage({super.key});
@@ -14,12 +18,39 @@ class RegisterPage extends StatefulWidget {
   State<RegisterPage> createState() => _RegisterPageState();
 }
 
+enum _AvailabilityStatus { idle, checking, available, taken, error }
+
 class _RegisterPageState extends State<RegisterPage>
     with TickerProviderStateMixin {
+  static const int _minRegistrationAgeYears = 13;
+  static const int _maxRegistrationAgeYears = 120;
+  static final RegExp _emailRegex = RegExp(
+    r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$',
+  );
+
+  final _givenNameController = TextEditingController();
+  final _middleNameController = TextEditingController();
+  final _lastNameController = TextEditingController();
   final _usernameController = TextEditingController();
   final _emailController = TextEditingController();
   final _phoneController = TextEditingController();
+  final _dobController = TextEditingController();
   final _passwordController = TextEditingController();
+  final _confirmPasswordController = TextEditingController();
+  String? _selectedGender;
+  bool _obscurePassword = true;
+  bool _obscureConfirmPassword = true;
+  final FocusNode _passwordFocusNode = FocusNode();
+  final FocusNode _confirmFocusNode = FocusNode();
+  Timer? _usernameDebounce;
+  Timer? _phoneDebounce;
+  Timer? _emailDebounce;
+  _AvailabilityStatus _usernameAvailability = _AvailabilityStatus.idle;
+  _AvailabilityStatus _phoneAvailability = _AvailabilityStatus.idle;
+  _AvailabilityStatus _emailAvailability = _AvailabilityStatus.idle;
+  int _usernameCheckSeq = 0;
+  int _phoneCheckSeq = 0;
+  int _emailCheckSeq = 0;
   bool _isLoading = false;
   late final AnimationController _bgController;
   late final AnimationController _entryController;
@@ -35,27 +66,304 @@ class _RegisterPageState extends State<RegisterPage>
       vsync: this,
       duration: const Duration(milliseconds: 700),
     )..forward();
+    for (final c in _allControllers) {
+      c.addListener(_onFormChanged);
+    }
+    _usernameController.addListener(_onUsernameChanged);
+    _phoneController.addListener(_onPhoneChanged);
+    _emailController.addListener(_onEmailChanged);
   }
 
   @override
   void dispose() {
+    _usernameDebounce?.cancel();
+    _phoneDebounce?.cancel();
+    _emailDebounce?.cancel();
+    _usernameController.removeListener(_onUsernameChanged);
+    _phoneController.removeListener(_onPhoneChanged);
+    _emailController.removeListener(_onEmailChanged);
+    for (final c in _allControllers) {
+      c.removeListener(_onFormChanged);
+    }
+    _givenNameController.dispose();
+    _middleNameController.dispose();
+    _lastNameController.dispose();
     _usernameController.dispose();
     _emailController.dispose();
     _phoneController.dispose();
+    _dobController.dispose();
     _passwordController.dispose();
+    _confirmPasswordController.dispose();
     _bgController.dispose();
     _entryController.dispose();
     super.dispose();
   }
 
+  String _formatDob(DateTime date) {
+    final mm = date.month.toString().padLeft(2, '0');
+    final dd = date.day.toString().padLeft(2, '0');
+    final yyyy = date.year.toString();
+    return '$mm/$dd/$yyyy';
+  }
+
+  Future<void> _pickDob() async {
+    final now = DateTime.now();
+    final oldestAllowed = DateTime(
+      now.year - _maxRegistrationAgeYears,
+      now.month,
+      now.day,
+    );
+    final youngestAllowed = DateTime(
+      now.year - _minRegistrationAgeYears,
+      now.month,
+      now.day,
+    );
+    final initial = DateTime(now.year - 18, now.month, now.day);
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: initial.isBefore(oldestAllowed) ||
+              initial.isAfter(youngestAllowed)
+          ? youngestAllowed
+          : initial,
+      firstDate: oldestAllowed,
+      lastDate: youngestAllowed,
+    );
+    if (picked == null || !mounted) return;
+    setState(() {
+      _dobController.text = _formatDob(picked);
+    });
+  }
+
+  bool _isDobValid(String dob) {
+    final raw = dob.trim();
+    final m = RegExp(r'^(\d{2})\/(\d{2})\/(\d{4})$').firstMatch(raw);
+    if (m == null) return false;
+    final month = int.tryParse(m.group(1)!);
+    final day = int.tryParse(m.group(2)!);
+    final year = int.tryParse(m.group(3)!);
+    if (month == null || day == null || year == null) return false;
+    final parsed = DateTime.tryParse(
+      '${year.toString().padLeft(4, '0')}-${month.toString().padLeft(2, '0')}-${day.toString().padLeft(2, '0')}',
+    );
+    if (parsed == null) return false;
+    if (parsed.month != month || parsed.day != day || parsed.year != year) {
+      return false;
+    }
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final oldestAllowed = DateTime(
+      today.year - _maxRegistrationAgeYears,
+      today.month,
+      today.day,
+    );
+    final youngestAllowed = DateTime(
+      today.year - _minRegistrationAgeYears,
+      today.month,
+      today.day,
+    );
+    return !parsed.isBefore(oldestAllowed) && !parsed.isAfter(youngestAllowed);
+  }
+
+  List<TextEditingController> get _allControllers => [
+        _givenNameController,
+        _middleNameController,
+        _lastNameController,
+        _usernameController,
+        _emailController,
+        _phoneController,
+        _dobController,
+        _passwordController,
+        _confirmPasswordController,
+      ];
+
+  void _onFormChanged() {
+    if (mounted) setState(() {});
+  }
+
+  void _onUsernameChanged() {
+    final username = normalizeAuthIdentifier(_usernameController.text);
+    _usernameDebounce?.cancel();
+    final reqId = ++_usernameCheckSeq;
+    if (username.isEmpty) {
+      setState(() => _usernameAvailability = _AvailabilityStatus.idle);
+      return;
+    }
+    setState(() => _usernameAvailability = _AvailabilityStatus.checking);
+    _usernameDebounce = Timer(const Duration(milliseconds: 450), () {
+      _checkAvailability(username: username, requestId: reqId);
+    });
+  }
+
+  void _onPhoneChanged() {
+    final phone = normalizePhilippineMobile(_phoneController.text);
+    _phoneDebounce?.cancel();
+    final reqId = ++_phoneCheckSeq;
+    if (phone == null) {
+      setState(() => _phoneAvailability = _AvailabilityStatus.idle);
+      return;
+    }
+    setState(() => _phoneAvailability = _AvailabilityStatus.checking);
+    _phoneDebounce = Timer(const Duration(milliseconds: 450), () {
+      _checkAvailability(phone: phone, requestId: reqId);
+    });
+  }
+
+  void _onEmailChanged() {
+    final email = normalizeAuthIdentifier(_emailController.text);
+    _emailDebounce?.cancel();
+    final reqId = ++_emailCheckSeq;
+    if (!_isEmailValid(email)) {
+      setState(() => _emailAvailability = _AvailabilityStatus.idle);
+      return;
+    }
+    setState(() => _emailAvailability = _AvailabilityStatus.checking);
+    _emailDebounce = Timer(const Duration(milliseconds: 450), () {
+      _checkAvailability(email: email, requestId: reqId);
+    });
+  }
+
+  Future<void> _checkAvailability({
+    String? username,
+    String? phone,
+    String? email,
+    required int requestId,
+  }) async {
+    try {
+      final supabase = Supabase.instance.client;
+      final dynamic raw = await supabase.rpc(
+        'check_registration_availability',
+        params: {
+          'p_username': username,
+          'p_phone_number': phone,
+          'p_email': email,
+        },
+      );
+      if (!mounted) return;
+
+      bool usernameTaken = false;
+      bool phoneTaken = false;
+      bool emailTaken = false;
+      if (raw is Map) {
+        usernameTaken = raw['username_taken'] == true;
+        phoneTaken = raw['phone_taken'] == true;
+        emailTaken = raw['email_taken'] == true;
+      } else if (raw is List && raw.isNotEmpty && raw.first is Map) {
+        final first = raw.first as Map;
+        usernameTaken = first['username_taken'] == true;
+        phoneTaken = first['phone_taken'] == true;
+        emailTaken = first['email_taken'] == true;
+      }
+
+      setState(() {
+        if (username != null && requestId == _usernameCheckSeq) {
+          _usernameAvailability = usernameTaken
+              ? _AvailabilityStatus.taken
+              : _AvailabilityStatus.available;
+        }
+        if (phone != null && requestId == _phoneCheckSeq) {
+          _phoneAvailability = phoneTaken
+              ? _AvailabilityStatus.taken
+              : _AvailabilityStatus.available;
+        }
+        if (email != null && requestId == _emailCheckSeq) {
+          _emailAvailability = emailTaken
+              ? _AvailabilityStatus.taken
+              : _AvailabilityStatus.available;
+        }
+      });
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        if (username != null && requestId == _usernameCheckSeq) {
+          _usernameAvailability = _AvailabilityStatus.error;
+        }
+        if (phone != null && requestId == _phoneCheckSeq) {
+          _phoneAvailability = _AvailabilityStatus.error;
+        }
+        if (email != null && requestId == _emailCheckSeq) {
+          _emailAvailability = _AvailabilityStatus.error;
+        }
+      });
+    }
+  }
+
+  bool _isEmailValid(String email) => _emailRegex.hasMatch(email);
+
+  bool get _isRegistrationFormValid {
+    final givenName = _givenNameController.text.trim();
+    final lastName = _lastNameController.text.trim();
+    final username = normalizeAuthIdentifier(_usernameController.text);
+    final email = normalizeAuthIdentifier(_emailController.text);
+    final dob = _dobController.text.trim();
+    final password = _passwordController.text.trim();
+    final confirm = _confirmPasswordController.text.trim();
+
+    if (givenName.isEmpty ||
+        lastName.isEmpty ||
+        username.isEmpty ||
+        email.isEmpty ||
+        dob.isEmpty ||
+        password.isEmpty ||
+        confirm.isEmpty ||
+        _selectedGender == null) {
+      return false;
+    }
+    if (!_isEmailValid(email)) return false;
+    if (!_isDobValid(dob)) return false;
+    if (normalizePhilippineMobile(_phoneController.text) == null) return false;
+    if (PasswordPolicy.validate(password) != null) return false;
+    if (password != confirm) return false;
+    if (_usernameAvailability != _AvailabilityStatus.available) return false;
+    if (_phoneAvailability != _AvailabilityStatus.available) return false;
+    if (_emailAvailability != _AvailabilityStatus.available) return false;
+    return true;
+  }
+
   Future<void> _handleRegistration() async {
     // Basic Validation
-    if (_usernameController.text.isEmpty ||
-        _emailController.text.isEmpty ||
+    if (_givenNameController.text.trim().isEmpty ||
+        _lastNameController.text.trim().isEmpty ||
+        _usernameController.text.trim().isEmpty ||
+        _emailController.text.trim().isEmpty ||
         _passwordController.text.isEmpty ||
-        _phoneController.text.trim().isEmpty) {
+        _confirmPasswordController.text.isEmpty ||
+        _phoneController.text.trim().isEmpty ||
+        _dobController.text.trim().isEmpty ||
+        _selectedGender == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Please fill in all required fields')),
+      );
+      return;
+    }
+    if (!_isDobValid(_dobController.text)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Enter a valid date of birth in MM/DD/YYYY (age 13 to 120).',
+          ),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+      return;
+    }
+
+    final password = _passwordController.text.trim();
+    final passwordPolicyError = PasswordPolicy.validate(password);
+    if (passwordPolicyError != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(passwordPolicyError),
+          backgroundColor: Colors.redAccent,
+        ),
+      );
+      return;
+    }
+    if (password != _confirmPasswordController.text.trim()) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Passwords do not match.'),
+          backgroundColor: Colors.redAccent,
+        ),
       );
       return;
     }
@@ -77,10 +385,18 @@ class _RegisterPageState extends State<RegisterPage>
 
     try {
       final supabase = Supabase.instance.client;
+      final givenName = _givenNameController.text.trim();
+      final middleName = _middleNameController.text.trim();
+      final lastName = _lastNameController.text.trim();
       final username = normalizeAuthIdentifier(_usernameController.text);
       final email = normalizeAuthIdentifier(_emailController.text);
+      final dob = _dobController.text.trim();
+      final sex = _selectedGender!;
+      final fullName = middleName.isEmpty
+          ? '$givenName $lastName'
+          : '$givenName $middleName $lastName';
 
-      if (!email.contains('@')) {
+      if (!_isEmailValid(email)) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
@@ -97,10 +413,17 @@ class _RegisterPageState extends State<RegisterPage>
 
       final AuthResponse res = await supabase.auth.signUp(
         email: email,
-        password: _passwordController.text.trim(),
+        password: password,
+        emailRedirectTo: emailConfirmRedirectUrl(),
         data: {
           'username': username,
           'phone_number': phoneNormalized,
+          'given_name': givenName,
+          'middle_name': middleName,
+          'last_name': lastName,
+          'full_name': fullName,
+          'date_of_birth': dob,
+          'sex': sex,
         },
       );
 
@@ -119,47 +442,24 @@ class _RegisterPageState extends State<RegisterPage>
         return;
       }
 
-      final profileRow = <String, dynamic>{
-        'id': res.user!.id,
-        'username': username,
-        'email': email,
-        'role': 'user',
-        'phone_number': phoneNormalized,
-      };
-
-      try {
-        await supabase.from('profiles').upsert(
-          profileRow,
-          onConflict: 'id',
-        );
-      } on PostgrestException catch (e, st) {
-        if (kDebugMode) {
-          debugPrint('profiles upsert failed: $e\n$st');
-        }
-        if (res.session != null) {
-          await supabase.auth.signOut();
-        }
-        if (!mounted) return;
-        ScaffoldMessenger.of(context).clearSnackBars();
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(registrationProfileErrorMessage(e)),
-            backgroundColor: Colors.redAccent,
-          ),
-        );
-        return;
-      }
+      // Profiles are created server-side by the auth.users trigger (handle_new_user).
+      // Avoid client-side upsert here because it may fail under RLS when email
+      // confirmation is required (session can be null), even though sign-up succeeded.
 
       if (!mounted) return;
 
-      final hasSession = res.session != null;
+      final confirmed = res.user!.emailConfirmedAt != null &&
+          res.user!.emailConfirmedAt!.trim().isNotEmpty;
+      final needsEmailVerification = !confirmed;
+
       ScaffoldMessenger.of(context).clearSnackBars();
       Navigator.pushReplacement(
         context,
         MaterialPageRoute(
-          builder: (context) => hasSession
-              ? const LocationPermissionPage(
-                  initialBannerText: kRegistrationSuccess,
+          builder: (context) => needsEmailVerification
+              ? LoginPage(
+                  showEmailVerificationRequired: true,
+                  registeredEmailForResend: email,
                 )
               : const LoginPage(
                   initialBannerText: kRegistrationCreatedUseSignIn,
@@ -332,29 +632,110 @@ class _RegisterPageState extends State<RegisterPage>
                             ),
                             const SizedBox(height: 24),
                             _buildInputField(
+                              label: 'Given Name',
+                              hint: 'your.givenname',
+                              controller: _givenNameController,
+                              keyboardType: TextInputType.name,
+                            ),
+                            const SizedBox(height: 16),
+                            _buildInputField(
+                              label: 'Middle Name',
+                              hint: '(optional)',
+                              controller: _middleNameController,
+                              keyboardType: TextInputType.name,
+                            ),
+                            const SizedBox(height: 16),
+                            _buildInputField(
+                              label: 'Last Name',
+                              hint: 'your.lastname',
+                              controller: _lastNameController,
+                              keyboardType: TextInputType.name,
+                            ),
+                            const SizedBox(height: 16),
+                            _buildInputField(
                               label: 'Username',
                               hint: 'your.username',
                               controller: _usernameController,
+                              keyboardType: TextInputType.text,
+                            ),
+                            _buildAvailabilityMessage(
+                              status: _usernameAvailability,
+                              idleMessage: '',
+                              checkingMessage: 'Checking username...',
+                              takenMessage: 'Username already taken',
+                              availableMessage: 'Username is available',
                             ),
                             const SizedBox(height: 16),
                             _buildInputField(
                               label: 'Email',
                               hint: 'your.email@example.com',
                               controller: _emailController,
+                              keyboardType: TextInputType.emailAddress,
+                            ),
+                            _buildAvailabilityMessage(
+                              status: _emailAvailability,
+                              idleMessage: '',
+                              checkingMessage: 'Checking email...',
+                              takenMessage: 'Email already registered',
+                              availableMessage: 'Email is available',
+                            ),
+                            const SizedBox(height: 16),
+                            _buildPhilippinePhoneField(),
+                            _buildAvailabilityMessage(
+                              status: _phoneAvailability,
+                              idleMessage: '',
+                              checkingMessage: 'Checking phone number...',
+                              takenMessage: 'Phone already registered',
+                              availableMessage: 'Phone number is available',
                             ),
                             const SizedBox(height: 16),
                             _buildInputField(
-                              label: 'Phone Number *',
-                              hint: '09XX XXX XXXX or +639XX XXX XXXX',
-                              controller: _phoneController,
-                              helperText: 'Philippine mobile number (required)',
+                              label: 'DOB (MM/DD/YYYY)',
+                              hint: 'MM/DD/YYYY',
+                              controller: _dobController,
+                              keyboardType: TextInputType.datetime,
+                              readOnly: true,
+                              onTap: _pickDob,
                             ),
+                            const SizedBox(height: 16),
+                            _buildGenderDropdown(),
                             const SizedBox(height: 16),
                             _buildInputField(
                               label: 'Password',
                               hint: '••••••••',
                               isPassword: true,
                               controller: _passwordController,
+                              focusNode: _passwordFocusNode,
+                              passwordObscured: _obscurePassword,
+                              onTogglePasswordVisibility: () => setState(
+                                () => _obscurePassword = !_obscurePassword,
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            PasswordRequirementsPanel(
+                              controller: _passwordController,
+                              focusNode: _passwordFocusNode,
+                              dense: true,
+                            ),
+                            const SizedBox(height: 16),
+                            _buildInputField(
+                              label: 'Confirm Password',
+                              hint: '••••••••',
+                              isPassword: true,
+                              controller: _confirmPasswordController,
+                              focusNode: _confirmFocusNode,
+                              passwordObscured: _obscureConfirmPassword,
+                              onTogglePasswordVisibility: () => setState(
+                                () => _obscureConfirmPassword =
+                                    !_obscureConfirmPassword,
+                              ),
+                            ),
+                            const SizedBox(height: 12),
+                            PasswordConfirmMatchPanel(
+                              passwordController: _passwordController,
+                              confirmController: _confirmPasswordController,
+                              confirmFocusNode: _confirmFocusNode,
+                              dense: true,
                             ),
                             const SizedBox(height: 24),
                             SizedBox(
@@ -362,6 +743,7 @@ class _RegisterPageState extends State<RegisterPage>
                               height: 54,
                               child: ElevatedButton(
                                 onPressed: _isLoading
+                                    || !_isRegistrationFormValid
                                     ? null
                                     : _handleRegistration,
                                 style: ElevatedButton.styleFrom(
@@ -426,13 +808,150 @@ class _RegisterPageState extends State<RegisterPage>
     );
   }
 
+  Widget _buildPhilippinePhoneField() {
+    const fill = Color(0xFFF4F8FF);
+    const labelColor = Color(0xFF12305E);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Phone Number',
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
+            fontSize: 15,
+            color: labelColor,
+          ),
+        ),
+        const SizedBox(height: 8),
+        Container(
+          decoration: BoxDecoration(
+            color: fill,
+            borderRadius: BorderRadius.circular(12),
+          ),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.center,
+            children: [
+              Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 14, vertical: 16),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text(
+                      '🇵🇭',
+                      style: TextStyle(fontSize: 20),
+                    ),
+                    const SizedBox(width: 8),
+                    Text(
+                      '+63',
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w700,
+                        color: labelColor,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Container(
+                width: 1,
+                height: 28,
+                color: labelColor.withValues(alpha: 0.15),
+              ),
+              Expanded(
+                child: TextField(
+                  controller: _phoneController,
+                  keyboardType: TextInputType.phone,
+                  inputFormatters: [
+                    PhilippineNationalMobileInputFormatter(),
+                  ],
+                  decoration: const InputDecoration(
+                    hintText: '9XX XXX XXXX',
+                    border: InputBorder.none,
+                    isDense: true,
+                    filled: false,
+                    contentPadding: EdgeInsets.symmetric(
+                      horizontal: 16,
+                      vertical: 16,
+                    ),
+                    hintStyle: TextStyle(color: Color(0x99000000)),
+                  ),
+                  style: const TextStyle(
+                    fontSize: 16,
+                    color: Color(0xFF12305E),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildAvailabilityMessage({
+    required _AvailabilityStatus status,
+    required String idleMessage,
+    required String checkingMessage,
+    required String takenMessage,
+    required String availableMessage,
+  }) {
+    String text;
+    Color color;
+    switch (status) {
+      case _AvailabilityStatus.idle:
+        text = idleMessage;
+        color = Colors.transparent;
+        break;
+      case _AvailabilityStatus.checking:
+        text = checkingMessage;
+        color = Colors.grey.shade600;
+        break;
+      case _AvailabilityStatus.taken:
+        text = takenMessage;
+        color = Colors.redAccent;
+        break;
+      case _AvailabilityStatus.available:
+        text = availableMessage;
+        color = Colors.green.shade700;
+        break;
+      case _AvailabilityStatus.error:
+        text = 'Cannot check availability right now.';
+        color = Colors.redAccent;
+        break;
+    }
+    if (text.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 6, left: 2),
+      child: Text(
+        text,
+        style: TextStyle(
+          fontSize: 12.5,
+          color: color,
+          fontWeight: FontWeight.w500,
+        ),
+      ),
+    );
+  }
+
   Widget _buildInputField({
     required String label,
     required String hint,
     required TextEditingController controller,
+    FocusNode? focusNode,
     bool isPassword = false,
     String? helperText,
+    TextInputType keyboardType = TextInputType.text,
+    bool readOnly = false,
+    VoidCallback? onTap,
+    bool? passwordObscured,
+    VoidCallback? onTogglePasswordVisibility,
   }) {
+    final bool showPasswordToggle =
+        isPassword && onTogglePasswordVisibility != null;
+    final bool effectiveObscure =
+        isPassword ? (passwordObscured ?? true) : false;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -447,9 +966,11 @@ class _RegisterPageState extends State<RegisterPage>
         const SizedBox(height: 8),
         TextField(
           controller: controller,
-          obscureText: isPassword,
-          keyboardType:
-              isPassword ? TextInputType.visiblePassword : TextInputType.phone,
+          focusNode: focusNode,
+          obscureText: effectiveObscure,
+          keyboardType: isPassword ? TextInputType.visiblePassword : keyboardType,
+          readOnly: readOnly,
+          onTap: onTap,
           decoration: InputDecoration(
             hintText: hint,
             helperText: helperText,
@@ -463,7 +984,61 @@ class _RegisterPageState extends State<RegisterPage>
               horizontal: 16,
               vertical: 16,
             ),
+            suffixIcon: showPasswordToggle
+                ? IconButton(
+                    tooltip: effectiveObscure ? 'Show password' : 'Hide password',
+                    onPressed: onTogglePasswordVisibility,
+                    icon: Icon(
+                      effectiveObscure
+                          ? Icons.visibility_outlined
+                          : Icons.visibility_off_outlined,
+                      color: const Color(0xFF12305E),
+                    ),
+                  )
+                : null,
           ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildGenderDropdown() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const Text(
+          'Gender',
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
+            fontSize: 15,
+            color: Color(0xFF12305E),
+          ),
+        ),
+        const SizedBox(height: 8),
+        DropdownButtonFormField<String>(
+          initialValue: _selectedGender,
+          items: const [
+            DropdownMenuItem(value: 'Male', child: Text('Male')),
+            DropdownMenuItem(value: 'Female', child: Text('Female')),
+            DropdownMenuItem(
+              value: 'Prefer not to say',
+              child: Text('Prefer not to say'),
+            ),
+          ],
+          onChanged: (value) => setState(() => _selectedGender = value),
+          decoration: InputDecoration(
+            filled: true,
+            fillColor: const Color(0xFFF4F8FF),
+            border: OutlineInputBorder(
+              borderRadius: BorderRadius.circular(12),
+              borderSide: BorderSide.none,
+            ),
+            contentPadding: const EdgeInsets.symmetric(
+              horizontal: 16,
+              vertical: 16,
+            ),
+          ),
+          hint: const Text('Select gender'),
         ),
       ],
     );

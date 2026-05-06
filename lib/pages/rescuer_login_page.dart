@@ -14,6 +14,7 @@ class _RescuerLoginPageState extends State<RescuerLoginPage> {
   final TextEditingController _rescuerIdController = TextEditingController();
   final TextEditingController _passwordController = TextEditingController();
   final FocusNode _passwordFocusNode = FocusNode();
+  bool _obscurePassword = true;
   bool _isSubmitting = false;
 
   @override
@@ -240,6 +241,10 @@ class _RescuerLoginPageState extends State<RescuerLoginPage> {
                         focusNode: _passwordFocusNode,
                         textInputAction: TextInputAction.done,
                         onSubmitted: (_) => _handlePortalAccess(),
+                        passwordObscured: _obscurePassword,
+                        onTogglePasswordVisibility: () => setState(
+                          () => _obscurePassword = !_obscurePassword,
+                        ),
                       ),
                       const SizedBox(height: 30),
                       SizedBox(
@@ -311,7 +316,12 @@ class _RescuerLoginPageState extends State<RescuerLoginPage> {
     FocusNode? focusNode,
     TextInputAction? textInputAction,
     ValueChanged<String>? onSubmitted,
+    bool? passwordObscured,
+    VoidCallback? onTogglePasswordVisibility,
   }) {
+    final showToggle = isPassword && onTogglePasswordVisibility != null;
+    final effectiveObscure = isPassword ? (passwordObscured ?? true) : false;
+
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -328,7 +338,9 @@ class _RescuerLoginPageState extends State<RescuerLoginPage> {
           focusNode: focusNode,
           textInputAction: textInputAction,
           onSubmitted: onSubmitted,
-          obscureText: isPassword,
+          obscureText: effectiveObscure,
+          keyboardType:
+              isPassword ? TextInputType.visiblePassword : TextInputType.text,
           style: const TextStyle(color: Colors.white),
           decoration: InputDecoration(
             prefixIcon: Icon(icon, color: Colors.white38),
@@ -340,6 +352,19 @@ class _RescuerLoginPageState extends State<RescuerLoginPage> {
               borderRadius: BorderRadius.circular(10),
               borderSide: const BorderSide(color: Colors.white10),
             ),
+            suffixIcon: showToggle
+                ? IconButton(
+                    tooltip:
+                        effectiveObscure ? 'Show password' : 'Hide password',
+                    onPressed: onTogglePasswordVisibility,
+                    icon: Icon(
+                      effectiveObscure
+                          ? Icons.visibility_outlined
+                          : Icons.visibility_off_outlined,
+                      color: Colors.white70,
+                    ),
+                  )
+                : null,
           ),
         ),
       ],

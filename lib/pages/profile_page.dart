@@ -292,6 +292,26 @@ class _ProfilePageState extends State<ProfilePage> {
     }
 
     try {
+      if (widget.isRescuerAccount) {
+        final offlineSaved = await _setRescuerOfflineBeforeLogout(
+          client: client,
+          userId: user.id,
+        );
+        if (!offlineSaved) {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text(
+                  'Could not set rescuer offline. Check your connection and try again.',
+                ),
+                backgroundColor: Colors.redAccent,
+              ),
+            );
+          }
+          return;
+        }
+      }
+
       await FcmService.instance.removeCurrentDeviceTokenFromSupabase();
 
       await client.auth.signOut(scope: SignOutScope.local);
@@ -306,6 +326,46 @@ class _ProfilePageState extends State<ProfilePage> {
 
     if (!mounted) return;
     _navigateToLoginAfterLogout();
+  }
+
+  Future<bool> _setRescuerOfflineBeforeLogout({
+    required SupabaseClient client,
+    required String userId,
+  }) async {
+    try {
+      try {
+        await client.auth.refreshSession();
+      } catch (_) {
+        // Best-effort refresh so RPC has a fresh access token.
+      }
+
+      final rpcResult = await client.rpc(
+        'set_rescuer_on_duty',
+        params: {'p_on_duty': false},
+      );
+
+      final raw = rpcResult is List && rpcResult.length == 1
+          ? rpcResult[0]
+          : rpcResult;
+      if (raw is bool) return raw == false;
+      if (raw is num) return raw == 0;
+      if (raw is String) {
+        final t = raw.toLowerCase().trim();
+        return t == 'false' || t == 'f' || t == '0';
+      }
+    } catch (_) {
+      // Fall through to direct update fallback below.
+    }
+
+    try {
+      await client
+          .from('profiles')
+          .update({'is_on_duty': false})
+          .eq('id', userId);
+      return true;
+    } catch (_) {
+      return false;
+    }
   }
 
   void _navigateToLoginAfterLogout() {

@@ -38,6 +38,9 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
+  static const MethodChannel _appControlChannel = MethodChannel(
+    'floote/app_control',
+  );
   final MapController _mapController = MapController();
   final TextEditingController _searchController = TextEditingController();
   gnav.GoogleMapViewController? _androidMapController;
@@ -459,6 +462,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       _isFloodWarningAhead = false;
       _isRerouting = false;
       _showUserNavStartBar = false;
+      _showRescuerNavStartBar = false;
       _searchController.clear();
       _isAutoCentering = true;
     });
@@ -488,8 +492,12 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     if (!mounted) return;
     setState(() {
       _isRerouting = false;
-      if (!widget.isRescuerAccount) {
-        _showUserNavStartBar = false;
+      // Keep Start visible so users can still begin guidance on the
+      // latest available route, even if no alternate reroute was found.
+      if (widget.isRescuerAccount) {
+        _showRescuerNavStartBar = _destinationPos != null;
+      } else {
+        _showUserNavStartBar = _destinationPos != null;
       }
     });
     ScaffoldMessenger.of(context).showSnackBar(
@@ -1055,6 +1063,18 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     }
   }
 
+  Future<void> _minimizeAppToBackground() async {
+    try {
+      if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+        await _appControlChannel.invokeMethod<bool>('moveTaskToBack');
+        return;
+      }
+      await SystemNavigator.pop();
+    } catch (_) {
+      await SystemNavigator.pop();
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final mapTabIndex = widget.isRescuerAccount ? 1 : 0;
@@ -1066,7 +1086,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         if (_bottomNavIndex != mapTabIndex) {
           setState(() => _bottomNavIndex = mapTabIndex);
         } else {
-          SystemNavigator.pop();
+          unawaited(_minimizeAppToBackground());
         }
       },
       child: Scaffold(
@@ -1207,10 +1227,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     }
 
     final routeStatus = _pathIsBlocked
-        ? "IMPASSABLE / ROAD CLOSED (Half-Tire Deep)"
-        : (_isFloodWarningAhead
-              ? "CAUTION: WATER ON ROAD (Gutter Deep)"
-              : "NO FLOOD / CLEAR");
+        ? "IMPASSABLE / ROAD CLOSED"
+        : (_isFloodWarningAhead ? "CAUTION: WATER ON ROAD" : "NO FLOOD / CLEAR");
     final statusColor = _pathIsBlocked
         ? _dangerColor
         : (_isFloodWarningAhead ? Colors.orangeAccent : _accentColor);
@@ -1476,7 +1494,11 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     setState(() {
       _destinationPos = dest;
       _isAutoCentering = false;
-      _showUserNavStartBar = false;
+      if (widget.isRescuerAccount) {
+        _showRescuerNavStartBar = true;
+      } else {
+        _showUserNavStartBar = true;
+      }
       _searchController.text = displayName;
     });
     _getInitialRoute(dest);
@@ -1735,14 +1757,12 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   /// Placeholder for flood-aware navigation start (wire to FastAPI / route later).
   Future<void> _handleRescuerStartNavigation() async {
     final dispatchId = _activeRescueDispatchId;
-    final destination = _activeRescueDestination;
-    if (dispatchId == null || destination == null) {
+    final destination = _activeRescueDestination ?? _destinationPos;
+    if (destination == null) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text(
-            'Accept an SOS with a valid destination before starting navigation.',
-          ),
+          content: Text('Select a destination before starting navigation.'),
         ),
       );
       return;
@@ -1771,14 +1791,32 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     }
 
     if (!mounted) return;
+    if (dispatchId != null && _activeRescueDestination != null) {
+      await Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => RescuerNavigationPage(
+            dispatchId: dispatchId,
+            ticketNumber: _activeRescueTicketNumber,
+            initialOrigin: _currentPCPos!,
+            initialDestination: destination,
+            initialHazardReports: verifiedReports,
+            initialPreferredPolyline: _routePoints,
+          ),
+        ),
+      );
+      return;
+    }
+
     await Navigator.push(
       context,
       MaterialPageRoute(
-        builder: (_) => RescuerNavigationPage(
-          dispatchId: dispatchId,
-          ticketNumber: _activeRescueTicketNumber,
+        builder: (_) => UserNavigationPage(
           initialOrigin: _currentPCPos!,
-          initialDestination: destination,
+          destination: destination,
+          destinationLabel: _searchController.text.trim().isEmpty
+              ? 'Destination'
+              : _searchController.text.trim(),
           initialHazardReports: verifiedReports,
           initialPreferredPolyline: _routePoints,
         ),
@@ -1838,6 +1876,10 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   Widget _buildRescuerNavigationStartBar() {
+    final hasActiveDispatch =
+        _activeRescueDispatchId != null && _activeRescueDestination != null;
+    final label = hasActiveDispatch ? 'Start Rescue' : 'Start to Destination';
+
     return Positioned(
       left: 14,
       right: 14,
@@ -1863,8 +1905,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                 ),
               ),
               icon: const Icon(Icons.navigation_rounded, size: 22),
-              label: const Text(
-                'Start',
+              label: Text(
+                label,
                 style: TextStyle(
                   fontWeight: FontWeight.w800,
                   fontSize: 16,

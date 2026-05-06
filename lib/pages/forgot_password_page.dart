@@ -1,7 +1,102 @@
-import 'package:flutter/material.dart';
+import 'dart:async';
 
-class ForgotPasswordPage extends StatelessWidget {
+import 'package:first/utils/auth_login.dart';
+import 'package:flutter/material.dart';
+import 'package:supabase_flutter/supabase_flutter.dart';
+
+class ForgotPasswordPage extends StatefulWidget {
   const ForgotPasswordPage({super.key});
+
+  @override
+  State<ForgotPasswordPage> createState() => _ForgotPasswordPageState();
+}
+
+class _ForgotPasswordPageState extends State<ForgotPasswordPage> {
+  static const String _resetRedirectUrl = String.fromEnvironment(
+    'PASSWORD_RESET_REDIRECT_URL',
+    defaultValue: '',
+  );
+  static final RegExp _emailRegex = RegExp(
+    r'^[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}$',
+    caseSensitive: false,
+  );
+  static const Duration _requestTimeout = Duration(seconds: 15);
+  static const Duration _resendCooldown = Duration(seconds: 30);
+
+  final TextEditingController _emailController = TextEditingController();
+  bool _isLoading = false;
+  DateTime? _lastSentAt;
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    super.dispose();
+  }
+
+  bool _isInCooldown() {
+    final last = _lastSentAt;
+    if (last == null) return false;
+    return DateTime.now().difference(last) < _resendCooldown;
+  }
+
+  void _showBanner(
+    String message, {
+    bool success = false,
+  }) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).clearSnackBars();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: success ? Colors.green : Colors.redAccent,
+      ),
+    );
+  }
+
+  Future<void> _sendResetLink() async {
+    if (_isLoading) return;
+
+    final email = normalizeAuthIdentifier(_emailController.text);
+    if (email.isEmpty || !_emailRegex.hasMatch(email)) {
+      _showBanner(kRegistrationEmailInvalid);
+      return;
+    }
+    if (_isInCooldown()) {
+      _showBanner('Please wait a few seconds before requesting again.');
+      return;
+    }
+
+    setState(() => _isLoading = true);
+    try {
+      final client = Supabase.instance.client;
+
+      await client.auth
+          .resetPasswordForEmail(
+            email,
+            redirectTo: _resetRedirectUrl.isNotEmpty ? _resetRedirectUrl : null,
+          )
+          .timeout(_requestTimeout);
+
+      _lastSentAt = DateTime.now();
+      _showBanner(
+        'If an account exists for this email, a password reset link has been sent.',
+        success: true,
+      );
+    } on TimeoutException {
+      _showBanner('Request timed out. Check your connection and try again.');
+    } on AuthException catch (_) {
+      // Keep a generic response to avoid account enumeration.
+      _lastSentAt = DateTime.now();
+      _showBanner(
+        'If an account exists for this email, a password reset link has been sent.',
+        success: true,
+      );
+    } catch (_) {
+      _showBanner('Unable to send reset link right now. Please try again later.');
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -75,7 +170,10 @@ class ForgotPasswordPage extends StatelessWidget {
               ),
               const SizedBox(height: 8),
               TextField(
+                controller: _emailController,
                 keyboardType: TextInputType.emailAddress,
+                textInputAction: TextInputAction.done,
+                onSubmitted: (_) => _sendResetLink(),
                 decoration: InputDecoration(
                   hintText: 'your.email@example.com',
                   hintStyle: TextStyle(color: Colors.grey[400]),
@@ -98,14 +196,7 @@ class ForgotPasswordPage extends StatelessWidget {
                 width: double.infinity,
                 height: 56,
                 child: ElevatedButton(
-                  onPressed: () {
-                    // Add password reset logic here later
-                    ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                        content: Text('Reset link sent to your email!'),
-                      ),
-                    );
-                  },
+                  onPressed: _isLoading ? null : _sendResetLink,
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFF1A60FF),
                     shape: RoundedRectangleBorder(
@@ -113,14 +204,23 @@ class ForgotPasswordPage extends StatelessWidget {
                     ),
                     elevation: 0,
                   ),
-                  child: const Text(
-                    'Send Reset Link',
-                    style: TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white,
-                    ),
-                  ),
+                  child: _isLoading
+                      ? const SizedBox(
+                          width: 22,
+                          height: 22,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2.5,
+                            color: Colors.white,
+                          ),
+                        )
+                      : const Text(
+                          'Send Reset Link',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                            color: Colors.white,
+                          ),
+                        ),
                 ),
               ),
             ],

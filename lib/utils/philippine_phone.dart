@@ -1,3 +1,27 @@
+/// For the Philippines national segment field (digits after +63): strip spaces and
+/// common pasted prefixes (`63…`, leading `0`) and cap at 10 digits.
+String extractPhilippineNationalInputDigits(String input) {
+  var d = input.replaceAll(RegExp(r'\D'), '');
+  if (d.startsWith('63')) {
+    d = d.substring(2);
+  } else if (d.startsWith('0')) {
+    d = d.substring(1);
+  }
+  if (d.length > 10) d = d.substring(0, 10);
+  return d;
+}
+
+/// Formats exactly 10 national mobile digits as `XXX XXX XXXX`.
+String formatPhilippineNationalMobileDisplay(String tenDigits) {
+  if (tenDigits.isEmpty) return '';
+  final b = StringBuffer();
+  for (var i = 0; i < tenDigits.length; i++) {
+    if (i == 3 || i == 6) b.write(' ');
+    b.write(tenDigits[i]);
+  }
+  return b.toString();
+}
+
 /// Philippine mobile numbers: national format `09XXXXXXXXX` or E.164 `+639XXXXXXXXX`.
 ///
 /// **Sanitization:** All non-digits are stripped first (handles paste with spaces,

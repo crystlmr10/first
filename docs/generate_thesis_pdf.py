@@ -110,6 +110,10 @@ if __name__ == "__main__":
             base / "thesis_defense_report_smart_routing_iot.md",
             base / "thesis_defense_report_smart_routing_iot.pdf",
         ),
+        (
+            base / "routing_architecture_and_algorithms.md",
+            base / "routing_architecture_and_algorithms.pdf",
+        ),
     ]
     for md, pdf in jobs:
         if not md.exists():

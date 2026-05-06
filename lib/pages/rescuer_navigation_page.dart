@@ -61,8 +61,15 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
   List<LatLng> _backendPolyline = const <LatLng>[];
   List<Map<String, dynamic>> _latestHazards = const <Map<String, dynamic>>[];
   String _lastHazardDigest = '';
+  int? _distanceToFinalDestinationMeters;
+  int? _timeToFinalDestinationSeconds;
+  int? _fallbackDistanceToFinalMeters;
+  int? _fallbackEtaToFinalSeconds;
+  bool _arrivedAtPinDestination = false;
   bool _enRouteSynced = false;
   bool _closedSynced = false;
+  static const double _finalArrivalToleranceMeters = 20.0;
+  static const double _fallbackEtaMetersPerSecond = 8.33; // ~30 km/h
 
   @override
   void initState() {
@@ -98,16 +105,18 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
         _statusText = 'Navigation ready. Calculating safest route...';
       });
       _arrivalSub = gnav.GoogleMapsNavigator.setOnArrivalListener((event) {
-        if (!mounted) return;
-        unawaited(_markDispatchClosedIfNeeded());
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Arrived at destination.')),
-        );
+        unawaited(_handleArrivalEvent(event));
       });
       _navInfoSub = gnav.GoogleMapsNavigator.setNavInfoListener((event) {
         if (!mounted) return;
         final navState = event.navInfo.navState.name;
-        setState(() => _statusText = 'Guidance: $navState');
+        setState(() {
+          _statusText = 'Guidance: $navState';
+          _distanceToFinalDestinationMeters =
+              event.navInfo.distanceToFinalDestinationMeters;
+          _timeToFinalDestinationSeconds =
+              event.navInfo.timeToFinalDestinationSeconds;
+        });
       });
       final preferred = _buildPreferredInitialResult();
       if (preferred != null) {
@@ -127,6 +136,53 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
         _statusText = 'Navigation SDK init failed: $e';
       });
     }
+  }
+
+  Future<void> _handleArrivalEvent(gnav.OnArrivalEvent event) async {
+    if (!mounted || _arrivedAtPinDestination) return;
+    if (!_isFinalDestinationWaypoint(event.waypoint)) return;
+    final nearPin = await _isNearPinDestination();
+    if (!nearPin) return;
+    setState(() {
+      _arrivedAtPinDestination = true;
+      _routeStatus = 'arrived';
+      _statusText = 'Arrived at destination.';
+    });
+    await _markDispatchClosedIfNeeded();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Arrived at destination.')),
+    );
+  }
+
+  bool _isFinalDestinationWaypoint(gnav.NavigationWaypoint waypoint) {
+    final title = waypoint.title.trim().toLowerCase();
+    if (title == 'safe corridor') return false;
+
+    final target = waypoint.target;
+    if (target == null) return false;
+
+    final d = _distance.as(
+      LengthUnit.Meter,
+      LatLng(target.latitude, target.longitude),
+      _destination,
+    );
+    return d <= _finalArrivalToleranceMeters;
+  }
+
+  Future<bool> _isNearPinDestination() async {
+    final current = await _readCurrentOrigin();
+    if (current == null) return false;
+    final d = _distance.as(LengthUnit.Meter, current, _destination);
+    final sdkRemaining = _distanceToFinalDestinationMeters;
+    final sdkGateOk = sdkRemaining == null || sdkRemaining <= 25;
+    return d <= _finalArrivalToleranceMeters && sdkGateOk;
+  }
+
+  Future<void> _endTrip() async {
+    await gnav.GoogleMapsNavigator.stopGuidance();
+    if (!mounted) return;
+    Navigator.of(context).pop();
   }
 
   void _attachDispatchRealtime() {
@@ -391,6 +447,12 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
     bool showRouteUpdatedSnack = true,
   }) async {
     final navWaypoints = _buildConstrainedWaypoints(result);
+    final fallbackDistance = _estimateRemainingDistanceMeters(
+      origin: origin,
+      route: result.polyline,
+      destination: _destination,
+    );
+    final fallbackEta = (fallbackDistance / _fallbackEtaMetersPerSecond).ceil();
     try {
       final routeStatus = await gnav.GoogleMapsNavigator.setDestinations(
         gnav.Destinations(
@@ -416,6 +478,9 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
         _backendPolyline = result.polyline;
         _lastRerouteOrigin = origin;
         _lastHazardDigest = _hazardDigest(_latestHazards);
+        _fallbackDistanceToFinalMeters = fallbackDistance;
+        _fallbackEtaToFinalSeconds = fallbackEta;
+        _arrivedAtPinDestination = false;
       });
       if (showRouteUpdatedSnack && mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -514,6 +579,25 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
   List<gnav.NavigationWaypoint> _buildConstrainedWaypoints(
     FloodRouteResult result,
   ) {
+    final hasHazards = _latestHazards.any((report) {
+      final decision = (report['admin_decision'] ?? '')
+          .toString()
+          .trim()
+          .toLowerCase();
+      return decision == 'impassable' || decision == 'risky';
+    });
+    if (!hasHazards) {
+      return <gnav.NavigationWaypoint>[
+        gnav.NavigationWaypoint.withLatLngTarget(
+          title: widget.ticketNumber ?? 'Destination',
+          target: gnav.LatLng(
+            latitude: _destination.latitude,
+            longitude: _destination.longitude,
+          ),
+        ),
+      ];
+    }
+
     final polyline = result.polyline;
     if (polyline.length < 2) {
       return <gnav.NavigationWaypoint>[
@@ -781,6 +865,8 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
                     onViewCreated: (controller) {
                       _navViewController = controller;
                       unawaited(controller.setMyLocationEnabled(true));
+                      unawaited(controller.setNavigationHeaderEnabled(false));
+                      unawaited(controller.setNavigationFooterEnabled(false));
                       unawaited(_syncHazardOverlays());
                     },
                     initialMapColorScheme: gnav.MapColorScheme.light,
@@ -799,6 +885,36 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
                     child: CircularProgressIndicator(color: Color(0xFF00E4FF)),
                   ),
           ),
+          if (_arrivedAtPinDestination)
+            SafeArea(
+              top: false,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(14, 10, 14, 14),
+                child: SizedBox(
+                  width: double.infinity,
+                  child: FilledButton.icon(
+                    onPressed: _endTrip,
+                    style: FilledButton.styleFrom(
+                      backgroundColor: const Color(0xFF00C853),
+                      foregroundColor: const Color(0xFF0D141D),
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(14),
+                      ),
+                    ),
+                    icon: const Icon(Icons.stop_circle_outlined),
+                    label: const Text(
+                      'End Trip',
+                      style: TextStyle(
+                        fontWeight: FontWeight.w800,
+                        fontSize: 16,
+                        letterSpacing: 0.3,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
         ],
       ),
     );
@@ -850,6 +966,19 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
               fontWeight: FontWeight.w500,
             ),
           ),
+          if (_effectiveDistanceToFinalMeters != null ||
+              _effectiveEtaToFinalSeconds != null) ...[
+            const SizedBox(height: 4),
+            Text(
+              'ETA ${_formatEta(_effectiveEtaToFinalSeconds)}  |  '
+              'Distance ${_formatDistanceMeters(_effectiveDistanceToFinalMeters)}',
+              style: TextStyle(
+                color: Colors.blueGrey.shade50,
+                fontSize: 12.5,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
           if (_backendPolyline.isNotEmpty) ...[
             const SizedBox(height: 4),
             Text(
@@ -860,5 +989,56 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
         ],
       ),
     );
+  }
+
+  int? get _effectiveDistanceToFinalMeters =>
+      _distanceToFinalDestinationMeters ?? _fallbackDistanceToFinalMeters;
+  int? get _effectiveEtaToFinalSeconds =>
+      _timeToFinalDestinationSeconds ?? _fallbackEtaToFinalSeconds;
+
+  int _estimateRemainingDistanceMeters({
+    required LatLng origin,
+    required List<LatLng> route,
+    required LatLng destination,
+  }) {
+    if (route.length < 2) {
+      return _distance.as(LengthUnit.Meter, origin, destination).round();
+    }
+
+    var closestIdx = 0;
+    var minDistance = double.infinity;
+    for (var i = 0; i < route.length; i++) {
+      final d = _distance.as(LengthUnit.Meter, origin, route[i]);
+      if (d < minDistance) {
+        minDistance = d;
+        closestIdx = i;
+      }
+    }
+
+    double total = 0;
+    var prev = origin;
+    for (var i = closestIdx; i < route.length; i++) {
+      final curr = route[i];
+      total += _distance.as(LengthUnit.Meter, prev, curr);
+      prev = curr;
+    }
+    total += _distance.as(LengthUnit.Meter, prev, destination);
+    return total.round();
+  }
+
+  String _formatDistanceMeters(int? meters) {
+    if (meters == null || meters <= 0) return '--';
+    if (meters < 1000) return '$meters m';
+    return '${(meters / 1000).toStringAsFixed(1)} km';
+  }
+
+  String _formatEta(int? seconds) {
+    if (seconds == null || seconds <= 0) return '--';
+    final totalMinutes = (seconds / 60).ceil();
+    if (totalMinutes < 60) return '$totalMinutes min';
+    final hours = totalMinutes ~/ 60;
+    final mins = totalMinutes % 60;
+    if (mins == 0) return '$hours hr';
+    return '$hours hr $mins min';
   }
 }
