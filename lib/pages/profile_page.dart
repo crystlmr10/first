@@ -37,6 +37,7 @@ class _ProfilePageState extends State<ProfilePage> {
   bool _editing = false;
   bool _passwordExpanded = false;
   bool _saving = false;
+  bool _logoutInProgress = false;
   bool _loading = true;
   String? _loadError;
   String? _accountEmail;
@@ -265,6 +266,7 @@ class _ProfilePageState extends State<ProfilePage> {
   }
 
   Future<void> _logout() async {
+    if (_logoutInProgress) return;
     final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -283,31 +285,40 @@ class _ProfilePageState extends State<ProfilePage> {
       ),
     );
     if (ok != true || !mounted) return;
+    setState(() => _logoutInProgress = true);
 
     final client = Supabase.instance.client;
-    final user = client.auth.currentUser;
-    if (user == null) {
-      _navigateToLoginAfterLogout();
-      return;
-    }
+    final userId =
+        client.auth.currentUser?.id ?? client.auth.currentSession?.user.id;
 
     try {
       if (widget.isRescuerAccount) {
+        if (userId == null) {
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Could not verify rescuer session. Please sign in again and retry logout.',
+              ),
+              backgroundColor: Colors.redAccent,
+            ),
+          );
+          return;
+        }
         final offlineSaved = await _setRescuerOfflineBeforeLogout(
           client: client,
-          userId: user.id,
+          userId: userId,
         );
         if (!offlineSaved) {
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(
-                content: Text(
-                  'Could not set rescuer offline. Check your connection and try again.',
-                ),
-                backgroundColor: Colors.redAccent,
+          if (!mounted) return;
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text(
+                'Could not set rescuer offline. Check your connection and try again.',
               ),
-            );
-          }
+              backgroundColor: Colors.redAccent,
+            ),
+          );
           return;
         }
       }
@@ -316,12 +327,13 @@ class _ProfilePageState extends State<ProfilePage> {
 
       await client.auth.signOut(scope: SignOutScope.local);
     } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Could not sign out: $e')),
-        );
-      }
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not sign out: $e')),
+      );
       return;
+    } finally {
+      if (mounted) setState(() => _logoutInProgress = false);
     }
 
     if (!mounted) return;
@@ -332,6 +344,23 @@ class _ProfilePageState extends State<ProfilePage> {
     required SupabaseClient client,
     required String userId,
   }) async {
+    Future<bool> verifyOffline() async {
+      final row = await client
+          .from('profiles')
+          .select('is_on_duty')
+          .eq('id', userId)
+          .maybeSingle();
+      final raw = row?['is_on_duty'];
+      if (raw is bool) return raw == false;
+      if (raw is num) return raw == 0;
+      if (raw is String) {
+        final t = raw.toLowerCase().trim();
+        return t == 'false' || t == 'f' || t == '0';
+      }
+      return false;
+    }
+
+    bool rpcReturnedOffline = false;
     try {
       try {
         await client.auth.refreshSession();
@@ -347,22 +376,30 @@ class _ProfilePageState extends State<ProfilePage> {
       final raw = rpcResult is List && rpcResult.length == 1
           ? rpcResult[0]
           : rpcResult;
-      if (raw is bool) return raw == false;
-      if (raw is num) return raw == 0;
+      if (raw is bool) rpcReturnedOffline = raw == false;
+      if (raw is num) rpcReturnedOffline = raw == 0;
       if (raw is String) {
         final t = raw.toLowerCase().trim();
-        return t == 'false' || t == 'f' || t == '0';
+        rpcReturnedOffline = t == 'false' || t == 'f' || t == '0';
+      }
+
+      // Even when RPC reports success, still verify persisted state for admin view.
+      if (rpcReturnedOffline) {
+        if (await verifyOffline()) return true;
+        await Future<void>.delayed(const Duration(milliseconds: 300));
+        if (await verifyOffline()) return true;
       }
     } catch (_) {
       // Fall through to direct update fallback below.
     }
 
     try {
-      await client
-          .from('profiles')
-          .update({'is_on_duty': false})
-          .eq('id', userId);
-      return true;
+      await client.from('profiles').update({'is_on_duty': false}).eq('id', userId);
+
+      if (await verifyOffline()) return true;
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      if (await verifyOffline()) return true;
+      return false;
     } catch (_) {
       return false;
     }
@@ -871,21 +908,38 @@ class _ProfilePageState extends State<ProfilePage> {
           Material(
             color: Colors.transparent,
             child: InkWell(
-              onTap: _logout,
-              child: const Padding(
+              onTap: _logoutInProgress ? null : _logout,
+              child: Padding(
                 padding: EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                 child: Row(
                   children: [
-                    Icon(Icons.logout_rounded, color: Colors.redAccent, size: 22),
-                    SizedBox(width: 12),
-                    Text(
-                      'Log out',
-                      style: TextStyle(
-                        fontSize: 16,
-                        fontWeight: FontWeight.w700,
-                        color: Colors.redAccent,
+                    Icon(
+                      Icons.logout_rounded,
+                      color:
+                          _logoutInProgress ? Colors.blueGrey : Colors.redAccent,
+                      size: 22,
+                    ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        _logoutInProgress
+                            ? 'Setting offline status...'
+                            : 'Log out',
+                        style: TextStyle(
+                          fontSize: 16,
+                          fontWeight: FontWeight.w700,
+                          color: _logoutInProgress
+                              ? Colors.blueGrey
+                              : Colors.redAccent,
+                        ),
                       ),
                     ),
+                    if (_logoutInProgress)
+                      const SizedBox(
+                        width: 18,
+                        height: 18,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      ),
                   ],
                 ),
               ),
@@ -895,7 +949,6 @@ class _ProfilePageState extends State<ProfilePage> {
       ),
     );
   }
-
   Widget _buildSaveButton() {
     return SizedBox(
       width: double.infinity,

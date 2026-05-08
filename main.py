@@ -93,6 +93,10 @@ class RouteRequest(BaseModel):
     goal: str
     nodes: Dict[str, NodeInput]
     graph: Dict[str, List[EdgeInput]]
+    route_mode: Optional[str] = None
+    is_sos: bool = False
+    victim_lat: Optional[float] = None
+    victim_lng: Optional[float] = None
 
 
 def _euclidean_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -432,11 +436,132 @@ def _apply_supabase_flood_to_graph(
     return updated
 
 
+def _extract_impassable_hazards(reports: List[Dict[str, object]]) -> List[Tuple[float, float]]:
+    hazards: List[Tuple[float, float]] = []
+    for report in reports:
+        lat = _as_float(report.get("latitude"))
+        lng = _as_float(report.get("longitude"))
+        if lat is None or lng is None:
+            continue
+        if _report_is_impassable(report):
+            hazards.append((lat, lng))
+    return hazards
+
+
+def _point_in_any_impassable_zone(
+    point: Tuple[float, float],
+    hazards: List[Tuple[float, float]],
+    radius_meters: float = RADIUS_CHECK_METERS,
+) -> bool:
+    return any(is_within_radius(point, hazard, radius_meters) for hazard in hazards)
+
+
+def _route_length_meters(
+    route: List[str],
+    adjacency: Dict[str, List[Tuple[str, float, float, bool]]],
+) -> float:
+    total = 0.0
+    for i in range(len(route) - 1):
+        u, v = route[i], route[i + 1]
+        edge = next((e for e in adjacency.get(u, []) if e[0] == v), None)
+        if edge is None:
+            return float("inf")
+        total += edge[1]
+    return total
+
+
+def _pick_best_safe_candidate(
+    shortlist: List[Tuple[float, str]],
+    start: str,
+    adjacency: Dict[str, List[Tuple[str, float, float, bool]]],
+    all_nodes: Dict[str, Tuple[float, float]],
+    scorer,
+) -> Optional[Tuple[float, str, List[str]]]:
+    best: Optional[Tuple[float, str, List[str]]] = None
+    for goal_gap_m, candidate_id in shortlist:
+        candidate_route = a_star(start, candidate_id, adjacency, all_nodes, enforce_safety=True)
+        if not candidate_route:
+            continue
+        if check_route_for_impassable(candidate_route, adjacency, all_nodes):
+            continue
+        travel_m = _route_length_meters(candidate_route, adjacency)
+        if not math.isfinite(travel_m):
+            continue
+        score = scorer(travel_m, goal_gap_m)
+        if best is None or score < best[0]:
+            best = (score, candidate_id, candidate_route)
+    return best
+
+
+# Perimeter-biased proxy selection constants. The impassable zone radius is
+# RADIUS_CHECK_METERS (150m). We pick a safe node sitting just outside this
+# perimeter so the rescuer parks as close to the victim as is drivable.
+PROXY_PERIMETER_TARGET_METERS = 175.0   # ideal gap from victim
+PROXY_PERIMETER_MAX_GAP_METERS = 350.0  # hard cap; reject candidates farther than this
+PROXY_PERIMETER_GAP_PENALTY = 4.0       # weight on |gap - target| (perimeter pull)
+PROXY_PERIMETER_TRAVEL_WEIGHT = 0.5     # weight on rescuer travel distance
+
+
+def _compute_safe_proxy_route(
+    start: str,
+    goal: str,
+    adjacency: Dict[str, List[Tuple[str, float, float, bool]]],
+    all_nodes: Dict[str, Tuple[float, float]],
+    hazards: List[Tuple[float, float]],
+) -> Optional[Tuple[str, List[str]]]:
+    goal_point = all_nodes[goal]
+    candidates_all: List[Tuple[float, str]] = []
+    for node_id, point in all_nodes.items():
+        if node_id == start:
+            continue
+        if _point_in_any_impassable_zone(point, hazards):
+            continue
+        gap_m = _euclidean_meters(goal_point[0], goal_point[1], point[0], point[1])
+        candidates_all.append((gap_m, node_id))
+
+    if not candidates_all:
+        return None
+
+    # First pass: bias toward perimeter (~175m from victim, cap 350m).
+    perimeter_pool = [c for c in candidates_all if c[0] <= PROXY_PERIMETER_MAX_GAP_METERS]
+    perimeter_pool.sort(key=lambda x: abs(x[0] - PROXY_PERIMETER_TARGET_METERS))
+    perimeter_shortlist = perimeter_pool[: min(80, len(perimeter_pool))]
+    best = _pick_best_safe_candidate(
+        perimeter_shortlist,
+        start,
+        adjacency,
+        all_nodes,
+        scorer=lambda travel_m, gap_m: (travel_m * PROXY_PERIMETER_TRAVEL_WEIGHT)
+        + abs(gap_m - PROXY_PERIMETER_TARGET_METERS) * PROXY_PERIMETER_GAP_PENALTY,
+    )
+
+    # Fallback: if no node within the perimeter cap is reachable, widen the
+    # search to all safe candidates with the original travel + gap heuristic.
+    if best is None:
+        fallback_shortlist = sorted(candidates_all, key=lambda x: x[0])[:80]
+        best = _pick_best_safe_candidate(
+            fallback_shortlist,
+            start,
+            adjacency,
+            all_nodes,
+            scorer=lambda travel_m, gap_m: travel_m + (gap_m * 1.2),
+        )
+
+    if best is None:
+        return None
+    return (best[1], best[2])
+
+
 def _solve_route(
     start: str,
     goal: str,
     adjacency: Dict[str, List[Tuple[str, float, float, bool]]],
     all_nodes: Dict[str, Tuple[float, float]],
+    route_mode: Optional[str] = None,
+    is_sos: bool = False,
+    victim_lat: Optional[float] = None,
+    victim_lng: Optional[float] = None,
+    hazards: Optional[List[Tuple[float, float]]] = None,
 ) -> Dict[str, object]:
     """
     Shared route runner used by both GET and POST endpoints.
@@ -445,17 +570,61 @@ def _solve_route(
     """
     if start not in all_nodes or goal not in all_nodes:
         raise HTTPException(status_code=400, detail="Invalid start or goal node.")
+    hazards = hazards or []
+    victim_point = (
+        (victim_lat, victim_lng)
+        if victim_lat is not None and victim_lng is not None
+        else all_nodes[goal]
+    )
+    response_meta: Dict[str, object] = {
+        "target_mode": "exact",
+        "proxy_reason": None,
+        "target_lat": all_nodes[goal][0],
+        "target_lng": all_nodes[goal][1],
+        "victim_lat": victim_point[0],
+        "victim_lng": victim_point[1],
+        "victim_offset_m": 0,
+    }
     if start == goal:
         route = [start]
-        return {"status": "safe", "route": route, "polyline": build_polyline(route, all_nodes)}
+        return {"status": "safe", "route": route, "polyline": build_polyline(route, all_nodes), **response_meta}
 
     # Baseline route without safety constraints (for reroute detection).
     naive_route = a_star(start, goal, adjacency, all_nodes, enforce_safety=False)
 
     # Safety-first route.
     safe_route = a_star(start, goal, adjacency, all_nodes, enforce_safety=True)
+    rescue_mode = is_sos or (route_mode or "").strip().lower() in {"sos", "sos_rescue", "rescue"}
+    goal_in_impassable_zone = _point_in_any_impassable_zone(all_nodes[goal], hazards)
+    if rescue_mode and goal_in_impassable_zone:
+        proxy = _compute_safe_proxy_route(start, goal, adjacency, all_nodes, hazards)
+        if proxy is not None:
+            proxy_node, proxy_route = proxy
+            proxy_point = all_nodes[proxy_node]
+            victim_offset_m = _euclidean_meters(
+                victim_point[0],
+                victim_point[1],
+                proxy_point[0],
+                proxy_point[1],
+            )
+            response_meta.update(
+                {
+                    "target_mode": "safe_proxy",
+                    "proxy_reason": "victim_in_impassable_zone",
+                    "target_lat": proxy_point[0],
+                    "target_lng": proxy_point[1],
+                    "victim_offset_m": int(round(victim_offset_m)),
+                }
+            )
+            return {
+                "status": "rerouted",
+                "message": "Exact victim location unreachable by vehicle. Routing to nearest safe approach point.",
+                "route": proxy_route,
+                "polyline": build_polyline(proxy_route, all_nodes),
+                **response_meta,
+            }
     if not safe_route:
-        return {"status": "no_route", "route": [], "polyline": []}
+        return {"status": "no_route", "route": [], "polyline": [], **response_meta}
 
     status = "safe"
     if naive_route is not None and safe_route != naive_route:
@@ -467,10 +636,10 @@ def _solve_route(
         print("[reroute] Route validation detected unsafe segment, recomputing...")
         safe_route = a_star(start, goal, adjacency, all_nodes, enforce_safety=True)
         if not safe_route or check_route_for_impassable(safe_route, adjacency, all_nodes):
-            return {"status": "no_route", "route": [], "polyline": []}
+            return {"status": "no_route", "route": [], "polyline": [], **response_meta}
         status = "rerouted"
 
-    return {"status": status, "route": safe_route, "polyline": build_polyline(safe_route, all_nodes)}
+    return {"status": status, "route": safe_route, "polyline": build_polyline(safe_route, all_nodes), **response_meta}
 
 
 @app.get("/route")
@@ -480,8 +649,9 @@ def get_route(
 ):
     """Demo endpoint using built-in sample nodes/graph plus live flood reports."""
     reports = _fetch_supabase_flood_reports()
+    hazards = _extract_impassable_hazards(reports)
     graph_with_live_flood = _apply_supabase_flood_to_graph(graph, nodes, reports)
-    return _solve_route(start, goal, graph_with_live_flood, nodes)
+    return _solve_route(start, goal, graph_with_live_flood, nodes, hazards=hazards)
 
 
 @app.post("/route")
@@ -501,5 +671,16 @@ def post_route(payload: RouteRequest):
         ]
 
     reports = _fetch_supabase_flood_reports()
+    hazards = _extract_impassable_hazards(reports)
     graph_with_live_flood = _apply_supabase_flood_to_graph(dynamic_graph, dynamic_nodes, reports)
-    return _solve_route(payload.start, payload.goal, graph_with_live_flood, dynamic_nodes)
+    return _solve_route(
+        payload.start,
+        payload.goal,
+        graph_with_live_flood,
+        dynamic_nodes,
+        route_mode=payload.route_mode,
+        is_sos=payload.is_sos,
+        victim_lat=payload.victim_lat,
+        victim_lng=payload.victim_lng,
+        hazards=hazards,
+    )

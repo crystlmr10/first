@@ -46,6 +46,7 @@ class _RescuerRescueCenterPageState extends State<RescuerRescueCenterPage> {
   static const double _wideBreakpoint = 900;
 
   List<Map<String, dynamic>> _offerRows = [];
+  List<Map<String, dynamic>> _historyRows = [];
   Map<String, String> _citizenNames = {};
   bool _loading = true;
   String? _error;
@@ -202,6 +203,7 @@ class _RescuerRescueCenterPageState extends State<RescuerRescueCenterPage> {
           .order('created_at', ascending: false);
 
       final list = <Map<String, dynamic>>[];
+      final history = <Map<String, dynamic>>[];
       final userIds = <String>{};
       for (final raw in rows as List<dynamic>) {
         if (raw is! Map) continue;
@@ -212,6 +214,33 @@ class _RescuerRescueCenterPageState extends State<RescuerRescueCenterPage> {
           if (uidCit != null && uidCit.isNotEmpty) userIds.add(uidCit);
         }
         list.add(m);
+      }
+
+      final historyRows = await Supabase.instance.client
+          .from('sos_dispatch_offers')
+          .select('''
+            id, status, distance_m, created_at, responded_at,
+            sos_dispatches (
+              id, ticket_number, latitude, longitude, status, submitted_at, closed_at,
+              emergency_main_category, emergency_subcategory, emergency_other_note,
+              caller_phone,
+              user_id, assigned_rescuer_id
+            )
+          ''')
+          .eq('rescuer_id', uid)
+          .inFilter('status', ['accepted', 'declined'])
+          .order('responded_at', ascending: false)
+          .limit(100);
+
+      for (final raw in historyRows as List<dynamic>) {
+        if (raw is! Map) continue;
+        final m = Map<String, dynamic>.from(raw);
+        final d = m['sos_dispatches'];
+        if (d is Map) {
+          final uidCit = d['user_id']?.toString();
+          if (uidCit != null && uidCit.isNotEmpty) userIds.add(uidCit);
+        }
+        history.add(m);
       }
 
       final names = Map<String, String>.from(_citizenNames);
@@ -233,6 +262,7 @@ class _RescuerRescueCenterPageState extends State<RescuerRescueCenterPage> {
       if (!mounted) return;
       setState(() {
         _offerRows = list;
+        _historyRows = history;
         _citizenNames = names;
         _loading = false;
         _error = null;
@@ -656,6 +686,64 @@ class _RescuerRescueCenterPageState extends State<RescuerRescueCenterPage> {
     );
   }
 
+  Widget _historySection() {
+    if (_loading) {
+      return const _RescueCardShell(
+        child: Padding(
+          padding: EdgeInsets.all(24),
+          child: Center(child: CircularProgressIndicator()),
+        ),
+      );
+    }
+    if (_error != null) {
+      return _RescueCardShell(
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Text(_error!, style: TextStyle(color: Colors.red.shade800)),
+        ),
+      );
+    }
+
+    return _RescueCardShell(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Padding(
+            padding: EdgeInsets.fromLTRB(18, 18, 18, 10),
+            child: Text(
+              'SOS History',
+              style: TextStyle(fontWeight: FontWeight.w900, fontSize: 16),
+            ),
+          ),
+          const Divider(height: 1),
+          if (_historyRows.isEmpty)
+            const Padding(
+              padding: EdgeInsets.all(24),
+              child: Text(
+                'No SOS history yet for this rescuer.',
+                style: TextStyle(color: Colors.blueGrey, fontWeight: FontWeight.w600),
+              ),
+            )
+          else
+            ListView.separated(
+              shrinkWrap: true,
+              physics: const NeverScrollableScrollPhysics(),
+              padding: const EdgeInsets.all(16),
+              itemCount: _historyRows.length,
+              separatorBuilder: (_, __) => const SizedBox(height: 10),
+              itemBuilder: (context, i) {
+                return _SosHistoryCard(
+                  row: _historyRows[i],
+                  citizenNames: _citizenNames,
+                );
+              },
+            ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final w = MediaQuery.sizeOf(context).width;
@@ -695,6 +783,8 @@ class _RescuerRescueCenterPageState extends State<RescuerRescueCenterPage> {
             _incidentsSection(),
             const SizedBox(height: 14),
             _statusSection(),
+            const SizedBox(height: 14),
+            _historySection(),
             const SizedBox(height: 8),
           ],
         ),
@@ -713,6 +803,8 @@ class _RescuerRescueCenterPageState extends State<RescuerRescueCenterPage> {
               Expanded(child: _incidentsSectionInExpanded()),
               const SizedBox(height: 16),
               Expanded(child: _statusSectionInExpanded()),
+              const SizedBox(height: 16),
+              Expanded(child: _historySectionInExpanded()),
             ],
           ),
         ),
@@ -778,6 +870,10 @@ class _RescuerRescueCenterPageState extends State<RescuerRescueCenterPage> {
 
   Widget _statusSectionInExpanded() {
     return _statusSection();
+  }
+
+  Widget _historySectionInExpanded() {
+    return _historySection();
   }
 }
 
@@ -952,6 +1048,105 @@ class _SosOfferCard extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _SosHistoryCard extends StatelessWidget {
+  const _SosHistoryCard({
+    required this.row,
+    required this.citizenNames,
+  });
+
+  final Map<String, dynamic> row;
+  final Map<String, String> citizenNames;
+
+  @override
+  Widget build(BuildContext context) {
+    final rawDisp = row['sos_dispatches'];
+    if (rawDisp is! Map) return const SizedBox.shrink();
+    final disp = Map<String, dynamic>.from(rawDisp);
+
+    final ticket = disp['ticket_number']?.toString() ?? '—';
+    final uid = disp['user_id']?.toString();
+    final name = (uid != null ? citizenNames[uid] : null) ?? 'Citizen';
+    final offerStatus = row['status']?.toString().trim().toLowerCase() ?? '';
+    final dispatchStatus =
+        disp['status']?.toString().trim().toLowerCase() ?? '';
+    final badgeText = dispatchStatus == 'closed'
+        ? 'Rescued'
+        : (offerStatus == 'declined' ? 'Declined' : 'Accepted');
+    final badgeColor = dispatchStatus == 'closed'
+        ? const Color(0xFF2E7D32)
+        : (offerStatus == 'declined'
+            ? const Color(0xFFC62828)
+            : const Color(0xFF1565C0));
+
+    final respondedAt = DateTime.tryParse(
+      (row['responded_at'] ?? row['created_at'] ?? '').toString(),
+    );
+    final when = respondedAt == null
+        ? 'Time unavailable'
+        : '${respondedAt.toLocal().year}-${respondedAt.toLocal().month.toString().padLeft(2, '0')}-${respondedAt.toLocal().day.toString().padLeft(2, '0')} '
+            '${respondedAt.toLocal().hour.toString().padLeft(2, '0')}:${respondedAt.toLocal().minute.toString().padLeft(2, '0')}';
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.black.withValues(alpha: 0.06)),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.history, color: Colors.blueGrey),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  ticket,
+                  style: const TextStyle(fontWeight: FontWeight.w900),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  name,
+                  style: TextStyle(
+                    color: Colors.blueGrey.shade800,
+                    fontWeight: FontWeight.w700,
+                    fontSize: 13,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  when,
+                  style: TextStyle(
+                    color: Colors.blueGrey.shade600,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            decoration: BoxDecoration(
+              color: badgeColor.withValues(alpha: 0.13),
+              borderRadius: BorderRadius.circular(999),
+            ),
+            child: Text(
+              badgeText,
+              style: TextStyle(
+                color: badgeColor,
+                fontWeight: FontWeight.w800,
+                fontSize: 11,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

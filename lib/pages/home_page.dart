@@ -81,6 +81,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   bool _androidNavMapReady = false;
   String? _androidNavMapError;
   Timer? _rescuerPresenceTimer;
+  StreamSubscription<List<Map<String, dynamic>>>? _activeDispatchStatusSub;
 
   /// First bottom-nav item: Dashboard (rescuer) or Map (regular user).
   int _bottomNavIndex = 0;
@@ -127,6 +128,47 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       _useAndroidNavigationMapLayer &&
       !kIsWeb &&
       defaultTargetPlatform == TargetPlatform.android;
+  bool get _rescuerStartBarVisible =>
+      _showRescuerNavStartBar ||
+      _activeRescueDestination != null ||
+      _destinationPos != null;
+
+  bool _isDispatchClosedStatus(dynamic rawStatus) {
+    final status = (rawStatus ?? '').toString().trim().toLowerCase();
+    return status == 'closed';
+  }
+
+  void _bindActiveDispatchStatusSubscription(String? dispatchId) {
+    _activeDispatchStatusSub?.cancel();
+    _activeDispatchStatusSub = null;
+    final id = dispatchId?.trim();
+    if (id == null || id.isEmpty) return;
+    _activeDispatchStatusSub = Supabase.instance.client
+        .from('sos_dispatches')
+        .stream(primaryKey: const ['id'])
+        .eq('id', id)
+        .listen((rows) {
+          if (!mounted || rows.isEmpty) return;
+          final row = rows.first;
+          if (!_isDispatchClosedStatus(row['status'])) return;
+          if (_activeRescueDispatchId != id) return;
+
+          setState(() {
+            _activeRescueDispatchId = null;
+            _activeRescueTicketNumber = null;
+            _activeRescueDestination = null;
+            _showRescuerNavStartBar = false;
+            _routePoints = [];
+            _pathIsBlocked = false;
+            _isFloodWarningAhead = false;
+            _isRerouting = false;
+            // Active SOS dispatch is closed: always clear the rescuer
+            // destination so Start button disappears immediately.
+            _destinationPos = null;
+            _searchController.clear();
+          });
+        });
+  }
 
   @override
   void initState() {
@@ -267,12 +309,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
     }
 
     try {
-      try {
-        await Supabase.instance.client.auth.refreshSession();
-      } catch (e) {
-        debugPrint('duty persist: refreshSession skipped: $e');
-      }
-
       // Prefer SECURITY DEFINER RPC so duty persists even when direct UPDATE is blocked by RLS.
       // Deploy: supabase/sql/set_rescuer_on_duty_rpc.sql
       final rpcResult = await Supabase.instance.client.rpc(
@@ -327,11 +363,6 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
         return;
       }
       if (!mounted) return;
-      try {
-        await Supabase.instance.client.auth.refreshSession();
-      } catch (e) {
-        debugPrint('rescuer location push: refreshSession skipped: $e');
-      }
       await Supabase.instance.client.rpc(
         'set_rescuer_last_location',
         params: {
@@ -347,6 +378,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   @override
   void dispose() {
     _rescuerPresenceTimer?.cancel();
+    _activeDispatchStatusSub?.cancel();
     final descriptor = _androidBluePinDescriptor;
     if (descriptor != null) {
       unawaited(gnav.unregisterImage(descriptor));
@@ -455,6 +487,8 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
   }
 
   void _clearRoute() {
+    _activeDispatchStatusSub?.cancel();
+    _activeDispatchStatusSub = null;
     setState(() {
       _routePoints = [];
       _destinationPos = null;
@@ -463,6 +497,9 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
       _isRerouting = false;
       _showUserNavStartBar = false;
       _showRescuerNavStartBar = false;
+      _activeRescueDispatchId = null;
+      _activeRescueTicketNumber = null;
+      _activeRescueDestination = null;
       _searchController.clear();
       _isAutoCentering = true;
     });
@@ -1198,7 +1235,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
                     ),
                   ),
 
-                if (widget.isRescuerAccount && _showRescuerNavStartBar)
+                if (widget.isRescuerAccount && _rescuerStartBarVisible)
                   _buildRescuerNavigationStartBar(),
                 if (!widget.isRescuerAccount && _showUserNavStartBar)
                   _buildUserNavigationStartBar(),
@@ -1614,7 +1651,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
   Widget _buildSOSButton() {
     final hasBottomStartBar =
-        widget.isRescuerAccount ? _showRescuerNavStartBar : _showUserNavStartBar;
+        widget.isRescuerAccount ? _rescuerStartBarVisible : _showUserNavStartBar;
     return Positioned(
       bottom: hasBottomStartBar ? 92 : (_pathIsBlocked ? 78 : 28),
       right: 20,
@@ -1657,7 +1694,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
   Widget _buildFollowToggle() {
     final hasBottomStartBar =
-        widget.isRescuerAccount ? _showRescuerNavStartBar : _showUserNavStartBar;
+        widget.isRescuerAccount ? _rescuerStartBarVisible : _showUserNavStartBar;
     return Positioned(
       bottom: hasBottomStartBar ? 190 : (_pathIsBlocked ? 170 : 125),
       left: 18,
@@ -1707,7 +1744,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
 
   Widget _buildZoomControls() {
     final hasBottomStartBar =
-        widget.isRescuerAccount ? _showRescuerNavStartBar : _showUserNavStartBar;
+        widget.isRescuerAccount ? _rescuerStartBarVisible : _showUserNavStartBar;
     return Positioned(
       bottom: hasBottomStartBar ? 190 : (_pathIsBlocked ? 170 : 125),
       right: 18,
@@ -1991,6 +2028,7 @@ class _HomePageState extends State<HomePage> with TickerProviderStateMixin {
               _bottomNavIndex = 1;
               _showRescuerNavStartBar = true;
             });
+            _bindActiveDispatchStatusSubscription(dispatchId);
           },
         );
       case 3:

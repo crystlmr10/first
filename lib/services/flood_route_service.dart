@@ -12,15 +12,27 @@ class FloodRouteResult {
     required this.message,
     required this.polyline,
     required this.routeNodeIds,
+    this.targetMode = 'exact',
+    this.proxyReason,
+    this.targetPoint,
+    this.victimPoint,
+    this.victimOffsetMeters = 0,
   });
 
   final String status;
   final String message;
   final List<LatLng> polyline;
   final List<String> routeNodeIds;
+  final String targetMode;
+  final String? proxyReason;
+  final LatLng? targetPoint;
+  final LatLng? victimPoint;
+  final int victimOffsetMeters;
 
   bool get isUsable =>
       status == 'safe' || status == 'rerouted' || status == 'best_effort';
+
+  bool get isSafeProxyTarget => targetMode == 'safe_proxy';
 
   /// True when the route was vetted clear of flood hazards. False when the
   /// service had to fall back to the cleanest available road route that may
@@ -161,6 +173,9 @@ class FloodRouteService {
     required LatLng origin,
     required LatLng destination,
     required List<Map<String, dynamic>> hazardReports,
+    String routeMode = 'normal',
+    bool isSos = false,
+    LatLng? victimLocation,
   }) async {
     final seedPoints = <LatLng>[origin, destination];
     final attemptConfigs = <Map<String, dynamic>>[
@@ -176,6 +191,9 @@ class FloodRouteService {
         hazardReports: hazardReports,
         maxLane: cfg['maxLane'] as int,
         laneStepMeters: cfg['laneStepMeters'] as double,
+        routeMode: routeMode,
+        isSos: isSos,
+        victimLocation: victimLocation,
       );
       try {
         final response = await _http.post(
@@ -199,12 +217,29 @@ class FloodRouteService {
             ? (data['route'] as List).map((e) => e.toString()).toList()
             : const <String>[];
         final polyline = _parsePolyline(data['polyline']);
+        final targetMode = (data['target_mode'] ?? 'exact').toString();
+        final proxyReason = data['proxy_reason']?.toString();
+        final targetPoint = _parseLatLngPair(
+          data['target_lat'],
+          data['target_lng'],
+        );
+        final victimPoint = _parseLatLngPair(
+          data['victim_lat'],
+          data['victim_lng'],
+        );
+        final victimOffsetMeters =
+            (data['victim_offset_m'] as num?)?.round() ?? 0;
         if ((status == 'safe' || status == 'rerouted') && polyline.length >= 2) {
           return FloodRouteResult(
             status: status,
             message: messageRaw.isNotEmpty ? messageRaw : 'Route ready.',
             polyline: polyline,
             routeNodeIds: routeNodes,
+            targetMode: targetMode,
+            proxyReason: proxyReason,
+            targetPoint: targetPoint,
+            victimPoint: victimPoint,
+            victimOffsetMeters: victimOffsetMeters,
           );
         }
         message = messageRaw.isNotEmpty ? messageRaw : 'No safe route found.';
@@ -235,13 +270,20 @@ class FloodRouteService {
     required LatLng origin,
     required LatLng destination,
     required List<Map<String, dynamic>> hazardReports,
+    String routeMode = 'normal',
+    bool isSos = false,
+    LatLng? victimLocation,
   }) async {
     final base = await fetchSafestRoute(
       origin: origin,
       destination: destination,
       hazardReports: hazardReports,
+      routeMode: routeMode,
+      isSos: isSos,
+      victimLocation: victimLocation,
     );
     if (!base.isUsable) return base;
+    final effectiveDestination = base.targetPoint ?? destination;
 
     final impassableHazards = extractHazardPoints(
       hazardReports,
@@ -254,7 +296,10 @@ class FloodRouteService {
       return base;
     }
 
-    final direct = await _requestGoogleRoadRoute(<LatLng>[origin, destination]);
+    final direct = await _requestGoogleRoadRoute(<LatLng>[
+      origin,
+      effectiveDestination,
+    ]);
     debugPrint(
       'fetchRoadFollowingSafestRoute: direct route points=${direct.length}',
     );
@@ -270,6 +315,11 @@ class FloodRouteService {
         message: 'Road-following safe route confirmed.',
         polyline: direct,
         routeNodeIds: base.routeNodeIds,
+        targetMode: base.targetMode,
+        proxyReason: base.proxyReason,
+        targetPoint: base.targetPoint,
+        victimPoint: base.victimPoint,
+        victimOffsetMeters: base.victimOffsetMeters,
       );
     }
 
@@ -296,7 +346,7 @@ class FloodRouteService {
         for (final side in sides) {
           final waypoint = _perpendicularDeflectionWaypoint(
             origin: origin,
-            destination: destination,
+            destination: effectiveDestination,
             hazard: hazard,
             offsetMeters: offset,
             side: side,
@@ -304,7 +354,7 @@ class FloodRouteService {
           final retry = await _requestGoogleRoadRoute(<LatLng>[
             origin,
             waypoint,
-            destination,
+            effectiveDestination,
           ]);
           if (retry.length >= 2 &&
               !routeIntersectsHazards(
@@ -322,10 +372,21 @@ class FloodRouteService {
               message: 'Road-following route deflected around flood zone.',
               polyline: retry,
               routeNodeIds: base.routeNodeIds,
+              targetMode: base.targetMode,
+              proxyReason: base.proxyReason,
+              targetPoint: base.targetPoint,
+              victimPoint: base.victimPoint,
+              victimOffsetMeters: base.victimOffsetMeters,
             );
           }
         }
       }
+    }
+
+    // For SOS proxy-target flow, prefer the backend's verified safe-proxy
+    // corridor over a best-effort route that could drift toward the victim pin.
+    if (base.isSafeProxyTarget) {
+      return base;
     }
 
     // No clean alternative exists. Return the direct Google road route as a
@@ -341,7 +402,19 @@ class FloodRouteService {
           'near reported flood zones. Drive with caution.',
       polyline: direct,
       routeNodeIds: base.routeNodeIds,
+      targetMode: base.targetMode,
+      proxyReason: base.proxyReason,
+      targetPoint: base.targetPoint,
+      victimPoint: base.victimPoint,
+      victimOffsetMeters: base.victimOffsetMeters,
     );
+  }
+
+  static LatLng? _parseLatLngPair(dynamic rawLat, dynamic rawLng) {
+    final lat = rawLat is num ? rawLat.toDouble() : null;
+    final lng = rawLng is num ? rawLng.toDouble() : null;
+    if (lat == null || lng == null) return null;
+    return LatLng(lat, lng);
   }
 
   static List<LatLng> _hazardsOnRoute(
@@ -525,6 +598,9 @@ class FloodRouteService {
     required List<Map<String, dynamic>> hazardReports,
     required int maxLane,
     required double laneStepMeters,
+    String routeMode = 'normal',
+    bool isSos = false,
+    LatLng? victimLocation,
   }) {
     const Distance dist = Distance();
     final Map<String, dynamic> payloadNodes = {};
@@ -600,6 +676,11 @@ class FloodRouteService {
 
     final blockedNodes = <String>[];
     for (final hz in hazardReports) {
+      final decision = (hz['admin_decision'] ?? '')
+          .toString()
+          .trim()
+          .toLowerCase();
+      if (decision != 'impassable') continue;
       final hzLat = (hz['latitude'] as num?)?.toDouble();
       final hzLng = (hz['longitude'] as num?)?.toDouble();
       if (hzLat == null || hzLng == null) continue;
@@ -613,10 +694,14 @@ class FloodRouteService {
       });
     }
 
-    for (final b in blockedNodes.toSet()) {
-      payloadGraph.remove(b);
-      for (final edges in payloadGraph.values) {
-        edges.removeWhere((e) => e['to'] == b);
+    // Keep full candidate graph for SOS so backend can compute nearest safe
+    // proxy targets even when the victim pin is inside a blocked circle.
+    if (!isSos) {
+      for (final b in blockedNodes.toSet()) {
+        payloadGraph.remove(b);
+        for (final edges in payloadGraph.values) {
+          edges.removeWhere((e) => e['to'] == b);
+        }
       }
     }
 
@@ -627,6 +712,10 @@ class FloodRouteService {
       'graph': payloadGraph,
       'start': start,
       'goal': end,
+      'route_mode': routeMode,
+      'is_sos': isSos,
+      if (victimLocation != null) 'victim_lat': victimLocation.latitude,
+      if (victimLocation != null) 'victim_lng': victimLocation.longitude,
     };
   }
 }

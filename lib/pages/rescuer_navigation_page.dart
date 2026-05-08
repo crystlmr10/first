@@ -58,6 +58,22 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
   DateTime? _lastRerouteAt;
   LatLng? _lastRerouteOrigin;
   LatLng _destination = const LatLng(0, 0);
+  LatLng _activeNavigationTarget = const LatLng(0, 0);
+  bool _routingToSafeApproachPoint = false;
+  int _safeApproachVictimOffsetMeters = 0;
+  // Lock-until-far state for the safe-proxy waypoint. Once the backend picks
+  // a safe approach point, we keep using it across reroutes unless the victim
+  // drifts >50m or a new impassable hazard now covers the locked target.
+  LatLng? _lockedSafeProxyTarget;
+  LatLng? _lockedSafeProxyVictim;
+  static const double _safeProxyLockVictimDriftMeters = 50.0;
+  static const double _safeProxyLockHazardClearanceMeters = 150.0;
+  // Static-state gate: skip a recalc if the rescuer has not moved at least
+  // this far since the last calculation (treats the rescuer as parked).
+  static const double _staticStateMoveThresholdMeters = 25.0;
+  // Near-target gate: in safe-proxy mode, once the rescuer is within this
+  // radius of the safe waypoint we stop recalculating to avoid flicker.
+  static const double _nearTargetSkipRadiusMeters = 60.0;
   List<LatLng> _backendPolyline = const <LatLng>[];
   List<Map<String, dynamic>> _latestHazards = const <Map<String, dynamic>>[];
   String _lastHazardDigest = '';
@@ -68,6 +84,8 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
   bool _arrivedAtPinDestination = false;
   bool _enRouteSynced = false;
   bool _closedSynced = false;
+  bool _dispatchClosedRemotely = false;
+  bool _routeUpdateSnackShown = false;
   static const double _finalArrivalToleranceMeters = 20.0;
   static const double _fallbackEtaMetersPerSecond = 8.33; // ~30 km/h
 
@@ -75,6 +93,7 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
   void initState() {
     super.initState();
     _destination = widget.initialDestination;
+    _activeNavigationTarget = widget.initialDestination;
     _latestHazards = widget.initialHazardReports;
     _initializeAndStart();
     _attachDispatchRealtime();
@@ -126,8 +145,18 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
           safeStatusText: 'Guiding via preview safest route.',
           showRouteUpdatedSnack: false,
         );
+        // Preview points to the victim pin. Immediately force a proxy-aware
+        // recalculation so the SDK swaps to the safe approach point if the
+        // victim is inside an impassable flood area. Bypass the static-state
+        // and debounce gates because this is the first real run of the trip.
+        unawaited(
+          _recalculateRoute(reason: 'Apply safe waypoint', force: true),
+        );
       } else {
-        await _recalculateRoute(reason: 'Initial route');
+        await _recalculateRoute(
+          reason: 'Initial route',
+          force: true,
+        );
       }
     } catch (e) {
       if (!mounted) return;
@@ -165,7 +194,7 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
     final d = _distance.as(
       LengthUnit.Meter,
       LatLng(target.latitude, target.longitude),
-      _destination,
+      _activeNavigationTarget,
     );
     return d <= _finalArrivalToleranceMeters;
   }
@@ -173,7 +202,7 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
   Future<bool> _isNearPinDestination() async {
     final current = await _readCurrentOrigin();
     if (current == null) return false;
-    final d = _distance.as(LengthUnit.Meter, current, _destination);
+    final d = _distance.as(LengthUnit.Meter, current, _activeNavigationTarget);
     final sdkRemaining = _distanceToFinalDestinationMeters;
     final sdkGateOk = sdkRemaining == null || sdkRemaining <= 25;
     return d <= _finalArrivalToleranceMeters && sdkGateOk;
@@ -185,6 +214,34 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
     Navigator.of(context).pop();
   }
 
+  bool _isDispatchClosedStatus(dynamic rawStatus) {
+    final status = (rawStatus ?? '').toString().trim().toLowerCase();
+    return status == 'closed';
+  }
+
+  Future<void> _handleRemoteDispatchClosed() async {
+    if (_dispatchClosedRemotely || !mounted) return;
+    _dispatchClosedRemotely = true;
+    _hazardPoll?.cancel();
+    _hazardPoll = null;
+    try {
+      await gnav.GoogleMapsNavigator.stopGuidance();
+    } catch (_) {}
+    if (!mounted) return;
+    setState(() {
+      _calculating = false;
+      _routeStatus = 'closed';
+      _statusText = 'Dispatch closed. Returning to map...';
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(
+        content: Text('Dispatch closed. Returning to map.'),
+      ),
+    );
+    if (!mounted) return;
+    Navigator.of(context).maybePop();
+  }
+
   void _attachDispatchRealtime() {
     _dispatchSub?.cancel();
     _dispatchSub = Supabase.instance.client
@@ -194,6 +251,10 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
         .listen((rows) {
           if (rows.isEmpty || !mounted) return;
           final row = rows.first;
+          if (_isDispatchClosedStatus(row['status'])) {
+            unawaited(_handleRemoteDispatchClosed());
+            return;
+          }
           final lat = (row['latitude'] as num?)?.toDouble();
           final lng = (row['longitude'] as num?)?.toDouble();
           if (lat == null || lng == null) return;
@@ -230,15 +291,47 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
     return false;
   }
 
-  Future<void> _recalculateRoute({required String reason}) async {
+  Future<void> _recalculateRoute({
+    required String reason,
+    bool force = false,
+  }) async {
     if (!_sessionReady || _isDisposed) return;
-    if (_rerouteDebounced()) return;
+    if (_dispatchClosedRemotely) return;
+    if (!force && _rerouteDebounced()) return;
+
+    final origin = await _readCurrentOrigin() ?? widget.initialOrigin;
+
+    // Static-state gate: do not recalculate if the rescuer has not moved
+    // meaningfully since the last calculation. This avoids the periodic
+    // hazard-scan timer churning the route while the rescuer is parked.
+    if (!force) {
+      final last = _lastRerouteOrigin;
+      if (last != null) {
+        final moved = _distance.as(LengthUnit.Meter, last, origin);
+        if (moved < _staticStateMoveThresholdMeters) {
+          return;
+        }
+      }
+    }
+
+    // Near-target gate: in safe-proxy mode, once the rescuer is close to the
+    // safe waypoint we let Google Nav finish guidance without further
+    // recomputations. Recalculating this close can produce flickering routes.
+    if (!force && _routingToSafeApproachPoint) {
+      final remaining = _distance.as(
+        LengthUnit.Meter,
+        origin,
+        _activeNavigationTarget,
+      );
+      if (remaining <= _nearTargetSkipRadiusMeters) {
+        return;
+      }
+    }
+
     setState(() {
       _calculating = true;
       _statusText = '$reason...';
     });
-
-    final origin = await _readCurrentOrigin() ?? widget.initialOrigin;
     List<Map<String, dynamic>> hazards = widget.initialHazardReports;
     try {
       hazards = await FloodRouteService.fetchVerifiedHazardReports();
@@ -265,6 +358,18 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
       origin: origin,
       destination: _destination,
       hazardReports: hazards,
+      routeMode: 'sos_rescue',
+      isSos: true,
+      victimLocation: _destination,
+    );
+
+    // Apply lock-until-far so the rescuer's safe waypoint does not jump
+    // around between reroutes. If the lock is still valid, refetch the route
+    // toward the locked target so Google road-routes to a stable point.
+    result = await _applySafeProxyLock(
+      origin: origin,
+      result: result,
+      hazards: hazards,
     );
 
     // Trust the service's verdict. fetchRoadFollowingSafestRoute already
@@ -279,11 +384,104 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
         _statusText =
             'No safe route available right now. Waiting for route/hazard update.';
         _backendPolyline = const <LatLng>[];
+        _routingToSafeApproachPoint = false;
+        _safeApproachVictimOffsetMeters = 0;
       });
       return;
     }
 
     await _startGuidanceForResult(origin: origin, result: result);
+  }
+
+  bool _isSafeProxyLockStillValid({
+    required LatLng currentVictim,
+    required List<Map<String, dynamic>> hazards,
+  }) {
+    final locked = _lockedSafeProxyTarget;
+    final lockedVictim = _lockedSafeProxyVictim;
+    if (locked == null || lockedVictim == null) return false;
+
+    final victimDrift = _distance.as(
+      LengthUnit.Meter,
+      lockedVictim,
+      currentVictim,
+    );
+    if (victimDrift > _safeProxyLockVictimDriftMeters) return false;
+
+    final impassable = FloodRouteService.extractHazardPoints(
+      hazards,
+      decisions: const {'impassable'},
+    );
+    for (final h in impassable) {
+      final d = _distance.as(LengthUnit.Meter, locked, h);
+      if (d < _safeProxyLockHazardClearanceMeters) return false;
+    }
+    return true;
+  }
+
+  Future<FloodRouteResult> _applySafeProxyLock({
+    required LatLng origin,
+    required FloodRouteResult result,
+    required List<Map<String, dynamic>> hazards,
+  }) async {
+    // Clear the lock when not in proxy mode (victim no longer in flood).
+    if (!result.isSafeProxyTarget) {
+      _lockedSafeProxyTarget = null;
+      _lockedSafeProxyVictim = null;
+      return result;
+    }
+
+    // First proxy pick of this trip: lock the freshly-chosen target.
+    if (_lockedSafeProxyTarget == null || _lockedSafeProxyVictim == null) {
+      _lockedSafeProxyTarget = result.targetPoint ?? result.polyline.last;
+      _lockedSafeProxyVictim = _destination;
+      return result;
+    }
+
+    final lockValid = _isSafeProxyLockStillValid(
+      currentVictim: _destination,
+      hazards: hazards,
+    );
+    if (!lockValid) {
+      // Drift or hazard change broke the lock; relock to the new pick.
+      _lockedSafeProxyTarget = result.targetPoint ?? result.polyline.last;
+      _lockedSafeProxyVictim = _destination;
+      return result;
+    }
+
+    // Keep using the locked target. Refetch a road-following route toward it
+    // (treated as a normal destination since it sits outside any flood zone)
+    // so Google Nav has a stable point to road-route to.
+    final locked = _lockedSafeProxyTarget!;
+    final relock = await FloodRouteService.fetchRoadFollowingSafestRoute(
+      origin: origin,
+      destination: locked,
+      hazardReports: hazards,
+      routeMode: 'sos_rescue',
+      isSos: false,
+    );
+    if (!relock.isUsable || !relock.isFloodSafe) {
+      // Could not road-route to the locked target right now; relock to the
+      // backend's freshest valid pick so guidance keeps working.
+      _lockedSafeProxyTarget = result.targetPoint ?? result.polyline.last;
+      _lockedSafeProxyVictim = _destination;
+      return result;
+    }
+
+    final offsetM = _distance
+        .as(LengthUnit.Meter, locked, _destination)
+        .round();
+    return FloodRouteResult(
+      status: relock.status,
+      message: relock.message,
+      polyline: relock.polyline,
+      routeNodeIds: relock.routeNodeIds,
+      targetMode: 'safe_proxy',
+      proxyReason: 'locked_safe_target',
+      targetPoint: locked,
+      victimPoint: _destination,
+      victimOffsetMeters: offsetM,
+    );
   }
 
   bool _shouldKeepCurrentRoute(
@@ -446,36 +644,79 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
     String? safeStatusText,
     bool showRouteUpdatedSnack = true,
   }) async {
-    final navWaypoints = _buildConstrainedWaypoints(result);
+    // Resolve the actual driving target FIRST so waypoint construction below
+    // uses the safe-proxy point (when applicable) instead of the stale
+    // _activeNavigationTarget which still points at the victim during the
+    // first proxy refresh after preview.
+    final effectiveDestination = result.targetPoint ?? result.polyline.last;
+    _activeNavigationTarget = effectiveDestination;
+    final navWaypoints = _buildConstrainedWaypoints(
+      result,
+      target: effectiveDestination,
+    );
     final fallbackDistance = _estimateRemainingDistanceMeters(
       origin: origin,
       route: result.polyline,
-      destination: _destination,
+      destination: effectiveDestination,
     );
     final fallbackEta = (fallbackDistance / _fallbackEtaMetersPerSecond).ceil();
     try {
+      // In safe-proxy mode the only acceptable route is the one that ends at
+      // the chosen safe approach point and avoids the impassable flood zone.
+      // Disable the SDK's alternative-route suggestions so the rescuer cannot
+      // accidentally swipe to a flood-crossing alt (the SDK does not let us
+      // filter alternatives by hazard radius client-side). Normal trips keep
+      // the default behavior.
+      final routingOptions = result.isSafeProxyTarget
+          ? gnav.RoutingOptions(
+              alternateRoutesStrategy:
+                  gnav.NavigationAlternateRoutesStrategy.none,
+            )
+          : null;
       final routeStatus = await gnav.GoogleMapsNavigator.setDestinations(
         gnav.Destinations(
           waypoints: navWaypoints,
           displayOptions: gnav.NavigationDisplayOptions(
-            showDestinationMarkers: false,
+            // Show the SDK destination marker so the rescuer sees a pin at
+            // the actual driving target (the safe approach point in proxy
+            // mode, or the destination in normal mode). Without this the only
+            // visible pin is our custom blue victim pin, which makes it look
+            // like the route is heading to the victim.
+            showDestinationMarkers: true,
           ),
+          routingOptions: routingOptions,
         ),
       );
       await gnav.GoogleMapsNavigator.startGuidance();
       if (_navViewController != null) {
-        unawaited(_navViewController!.showRouteOverview());
+        // Camera follows the rescuer's GPS heading (tilted 3D perspective)
+        // so the on-screen arrow always matches the actual driving direction.
+        // Previously we used showRouteOverview(), which locks to north-up and
+        // makes the arrow look like it contradicts the heading.
+        unawaited(
+          _navViewController!.followMyLocation(
+            gnav.CameraPerspective.tilted,
+            zoomLevel: 17,
+          ),
+        );
         unawaited(_syncHazardOverlays());
-        unawaited(_renderBlueOriginDestinationPins(origin));
+        unawaited(_renderBlueOriginDestinationPins());
       }
       if (!mounted) return;
       setState(() {
         _routeStatus = routeStatus.name;
         _calculating = false;
-        _statusText = result.isFloodSafe
-            ? (safeStatusText ?? 'Guiding via safest route (${result.status}).')
-            : result.message;
+        _statusText = result.isSafeProxyTarget
+            ? 'Exact victim location unreachable by vehicle.'
+            : (result.isFloodSafe
+                ? (safeStatusText ??
+                    'Guiding via safest route (${result.status}).')
+                : result.message);
         _backendPolyline = result.polyline;
+        _activeNavigationTarget = effectiveDestination;
+        _routingToSafeApproachPoint = result.isSafeProxyTarget;
+        _safeApproachVictimOffsetMeters =
+            result.isSafeProxyTarget ? result.victimOffsetMeters : 0;
         _lastRerouteOrigin = origin;
         _lastHazardDigest = _hazardDigest(_latestHazards);
         _fallbackDistanceToFinalMeters = fallbackDistance;
@@ -483,15 +724,18 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
         _arrivedAtPinDestination = false;
       });
       if (showRouteUpdatedSnack && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              result.isFloodSafe
-                  ? 'Route updated for flood safety.'
-                  : 'Route updated. Caution: it may pass near a reported flood.',
+        if (!_routeUpdateSnackShown) {
+          _routeUpdateSnackShown = true;
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                result.isFloodSafe
+                    ? 'Route updated for flood safety.'
+                    : 'Route updated. Caution: it may pass near a reported flood.',
+              ),
             ),
-          ),
-        );
+          );
+        }
       }
       unawaited(_markDispatchEnRouteIfNeeded());
     } catch (e) {
@@ -577,8 +821,26 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
   }
 
   List<gnav.NavigationWaypoint> _buildConstrainedWaypoints(
-    FloodRouteResult result,
-  ) {
+    FloodRouteResult result, {
+    required LatLng target,
+  }) {
+    // Safe-proxy mode: the backend already chose a single drivable safe
+    // waypoint near the flood perimeter. Hand exactly ONE waypoint to Google
+    // Nav so it can produce a clean road-following polyline. Adding
+    // intermediate corridor waypoints here is what causes the multi-leg
+    // "extra nodes/edges" artifacts visible on the map.
+    if (result.isSafeProxyTarget) {
+      return <gnav.NavigationWaypoint>[
+        gnav.NavigationWaypoint.withLatLngTarget(
+          title: 'Nearest safe approach',
+          target: gnav.LatLng(
+            latitude: target.latitude,
+            longitude: target.longitude,
+          ),
+        ),
+      ];
+    }
+
     final hasHazards = _latestHazards.any((report) {
       final decision = (report['admin_decision'] ?? '')
           .toString()
@@ -591,8 +853,8 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
         gnav.NavigationWaypoint.withLatLngTarget(
           title: widget.ticketNumber ?? 'Destination',
           target: gnav.LatLng(
-            latitude: _destination.latitude,
-            longitude: _destination.longitude,
+            latitude: target.latitude,
+            longitude: target.longitude,
           ),
         ),
       ];
@@ -604,8 +866,8 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
         gnav.NavigationWaypoint.withLatLngTarget(
           title: widget.ticketNumber ?? 'Citizen SOS',
           target: gnav.LatLng(
-            latitude: _destination.latitude,
-            longitude: _destination.longitude,
+            latitude: target.latitude,
+            longitude: target.longitude,
           ),
         ),
       ];
@@ -659,10 +921,7 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
     // Final dedupe pass against the destination - the SDK rejects waypoints
     // that round to the same location with DUPLICATE_WAYPOINTS_ERROR.
     const double minPairwiseMeters = 30.0;
-    final orderedPoints = <LatLng>[
-      for (final p in selected) p,
-      _destination,
-    ];
+    final orderedPoints = <LatLng>[for (final p in selected) p, target];
     final cleanedPoints = <LatLng>[];
     for (int i = 0; i < orderedPoints.length; i++) {
       final p = orderedPoints[i];
@@ -684,10 +943,43 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
       cleanedPoints.add(p);
     }
 
-    final waypoints = <gnav.NavigationWaypoint>[];
+    // Remove intermediate points that are too close to the final target; these
+    // can create tiny visual "extra node/edge" artifacts near destination.
+    final destinationPoint = cleanedPoints.isNotEmpty
+        ? cleanedPoints.last
+        : target;
+    final prunedPoints = <LatLng>[];
     for (int i = 0; i < cleanedPoints.length; i++) {
       final p = cleanedPoints[i];
       final isLast = i == cleanedPoints.length - 1;
+      if (!isLast) {
+        final dToDestination = _distance.as(
+          LengthUnit.Meter,
+          p,
+          destinationPoint,
+        );
+        if (dToDestination < 120.0) {
+          continue;
+        }
+      }
+      prunedPoints.add(p);
+    }
+    if (prunedPoints.length >= 2) {
+      final beforeLast = prunedPoints[prunedPoints.length - 2];
+      final last = prunedPoints.last;
+      final tailGap = _distance.as(LengthUnit.Meter, beforeLast, last);
+      if (tailGap < 70.0) {
+        prunedPoints.removeAt(prunedPoints.length - 2);
+      }
+    }
+    if (prunedPoints.isEmpty) {
+      prunedPoints.add(target);
+    }
+
+    final waypoints = <gnav.NavigationWaypoint>[];
+    for (int i = 0; i < prunedPoints.length; i++) {
+      final p = prunedPoints[i];
+      final isLast = i == prunedPoints.length - 1;
       waypoints.add(
         gnav.NavigationWaypoint.withLatLngTarget(
           title: isLast
@@ -707,41 +999,35 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
     _hazardPoll?.cancel();
     _arrivalSub?.cancel();
     _navInfoSub?.cancel();
-    final descriptor = _bluePinDescriptor;
-    if (descriptor != null) {
-      unawaited(gnav.unregisterImage(descriptor));
+    final blueDescriptor = _bluePinDescriptor;
+    if (blueDescriptor != null) {
+      unawaited(gnav.unregisterImage(blueDescriptor));
     }
     unawaited(gnav.GoogleMapsNavigator.stopGuidance());
     unawaited(gnav.GoogleMapsNavigator.cleanup());
     super.dispose();
   }
 
-  Future<void> _renderBlueOriginDestinationPins(LatLng origin) async {
+  Future<void> _renderBlueOriginDestinationPins() async {
     final controller = _navViewController;
     if (controller == null) return;
     try {
-      final icon = await _ensureBluePinDescriptor();
+      final blueIcon = await _ensureBluePinDescriptor();
       await controller.clearMarkers();
-      await controller.addMarkers([
-        gnav.MarkerOptions(
-          position: gnav.LatLng(
-            latitude: origin.latitude,
-            longitude: origin.longitude,
+      final markers = <gnav.MarkerOptions>[
+        if (_routingToSafeApproachPoint)
+          gnav.MarkerOptions(
+            position: gnav.LatLng(
+              latitude: _destination.latitude,
+              longitude: _destination.longitude,
+            ),
+            // Keep one custom marker only: victim exact location.
+            // Safe waypoint marker is the SDK destination marker to avoid duplicates.
+            icon: blueIcon,
+            infoWindow: const gnav.InfoWindow(title: 'Victim exact location'),
           ),
-          icon: icon,
-          infoWindow: const gnav.InfoWindow(title: 'Origin'),
-        ),
-        gnav.MarkerOptions(
-          position: gnav.LatLng(
-            latitude: _destination.latitude,
-            longitude: _destination.longitude,
-          ),
-          icon: icon,
-          infoWindow: gnav.InfoWindow(
-            title: widget.ticketNumber ?? 'Destination',
-          ),
-        ),
-      ]);
+      ];
+      await controller.addMarkers(markers);
     } catch (e) {
       debugPrint('Failed to render blue origin/destination pins: $e');
     }
@@ -788,7 +1074,7 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
   Future<gnav.ImageDescriptor> _ensureBluePinDescriptor() async {
     final existing = _bluePinDescriptor;
     if (existing != null) return existing;
-    final byteData = await _buildBluePinIconByteData();
+    final byteData = await _buildPinIconByteData(const Color(0xFF1E88E5));
     final descriptor = await gnav.registerBitmapImage(
       bitmap: byteData,
       imagePixelRatio: 2,
@@ -799,7 +1085,7 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
     return descriptor;
   }
 
-  Future<ByteData> _buildBluePinIconByteData() async {
+  Future<ByteData> _buildPinIconByteData(Color fillColor) async {
     const width = 72.0;
     const height = 88.0;
     const cx = width / 2;
@@ -809,7 +1095,7 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
     final canvas = Canvas(recorder, const Rect.fromLTWH(0, 0, width, height));
 
     final fill = Paint()
-      ..color = const Color(0xFF1E88E5)
+      ..color = fillColor
       ..isAntiAlias = true;
     final stroke = Paint()
       ..color = const Color(0xFFFFFFFF)
@@ -966,6 +1252,18 @@ class _RescuerNavigationPageState extends State<RescuerNavigationPage> {
               fontWeight: FontWeight.w500,
             ),
           ),
+          if (_routingToSafeApproachPoint) ...[
+            const SizedBox(height: 4),
+            Text(
+              'Routing to nearest safe approach point '
+              '(${_safeApproachVictimOffsetMeters}m from victim).',
+              style: TextStyle(
+                color: Colors.amber.shade200,
+                fontSize: 12.5,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ],
           if (_effectiveDistanceToFinalMeters != null ||
               _effectiveEtaToFinalSeconds != null) ...[
             const SizedBox(height: 4),

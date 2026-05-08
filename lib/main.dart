@@ -172,7 +172,18 @@ class _AppEntryGateState extends State<_AppEntryGate> {
     _session = Supabase.instance.client.auth.currentSession;
     _authSub = Supabase.instance.client.auth.onAuthStateChange.listen((data) {
       if (!mounted) return;
-      setState(() => _session = data.session);
+      final next = data.session;
+      final prev = _session;
+
+      // Prevent full app-entry rebuild loops on token refresh events.
+      // Rebuild only when auth identity actually changes (signed in/out or user switch).
+      final identityChanged =
+          (prev?.user.id != next?.user.id) || ((prev == null) != (next == null));
+
+      _session = next;
+      if (identityChanged) {
+        setState(() {});
+      }
     });
   }
 
